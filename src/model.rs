@@ -31,6 +31,11 @@ pub struct LFM2Audio {
 }
 
 impl LFM2Audio {
+    /// Get a reference to the sessions (for async decode)
+    pub fn sessions(&self) -> &LFM2Sessions {
+        &self.sessions
+    }
+    
     /// Load model from directory
     pub fn from_pretrained<P: AsRef<Path>>(
         model_dir: P,

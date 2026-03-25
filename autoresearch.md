@@ -64,10 +64,12 @@ All source files may be modified:
 - After batch_frames=1: ~1200ms
 - After context_frames=0: ~519ms
 - After intra_threads=8: ~324ms
-- **Final (batch_frames=1, context_frames=0, intra_threads=8)**: `max_frame_gap_ms` **346ms**, RTF **0.96**
-- **With Arc<Mutex> detokenizer**: `max_frame_gap_ms` **346ms**, RTF **0.96** (unchanged, prerequisite for async)
+- **Sync decode (batch_frames=1, context_frames=0, intra_threads=8)**: `max_frame_gap_ms` **346ms**, RTF **0.96**
+- **Async decode pipeline**: `max_frame_gap_ms` **243-276ms**, RTF **0.55-0.78** ✅
 
-**Optimization Limit Reached**: Target of <30ms not achievable without async decode or GPU.
+**Current Best**: Async decode with background ONNX thread provides ~24% improvement in max gap and ~27% improvement in RTF.
+
+**Optimization Limit**: Target of <30ms not achievable without GPU acceleration.
 
 ## What's Been Tried
 
@@ -78,6 +80,7 @@ All source files may be modified:
 4. **Set context_frames=0** - Eliminate window growth, decode only pending frames
 5. **Set intra_threads=8** - More parallel ONNX execution for faster decode
 6. **Fixed tests** - Removed Mimi-specific tests after dependency removal
+7. **Async decode pipeline** - Background ONNX thread hides decode latency behind generation ✅
 
 ### Results Summary
 | Config | Max Gap | RTF | Notes |
@@ -86,18 +89,17 @@ All source files may be modified:
 | batch=1 | ~1200ms | ? | Marginally better |
 | ctx=0 | ~519ms | ? | Major improvement |
 | batch=1, ctx=0 | ~305-349ms | ~1.0 | 80% improvement |
-| batch=1, ctx=0, threads=8 | **324ms** | **0.969** | **Best result** |
-| batch=1, ctx=0, threads=16 | 343ms | 1.124 | Worse - thread contention |
-| batch=2, ctx=0, threads=4 | 422ms | 1.159 | Worse - longer decode batches |
+| batch=1, ctx=0, threads=8 | 324ms | 0.969 | Best sync result |
+| **Async decode** | **243-276ms** | **0.55-0.78** | **Best overall** |
 
 ### Remaining Bottleneck
-- Decode latency ~72ms per frame
-- Max gap 324ms still above 30ms target
-- Need async pipeline or GPU acceleration for <30ms gaps
+- Decode latency ~90ms per frame (ONNX CPU inference)
+- Max gap 243-276ms still above 30ms target
+- Need GPU acceleration for <30ms gaps
 
 ### Potential Future Optimizations
-1. **Async decode pipeline** - decode next batch while sending current audio (would require architectural changes)
-2. **GPU acceleration** - Use CUDA/Metal for ONNX execution
-3. **Pre-buffering** - start audio decode during text generation phase
-4. **Frame interpolation** - smooth over small gaps client-side
-5. **Smaller model** - if a faster audio detokenizer is available
+1. **GPU acceleration** - Use CUDA/Metal for ONNX execution (most impactful)
+2. **Multiple decode threads** - Parallel decode with separate sessions (complex)
+3. **Pre-buffering** - Start audio decode during text generation phase
+4. **Frame interpolation** - Smooth over small gaps client-side
+5. **Smaller model** - If a faster audio detokenizer is available

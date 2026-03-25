@@ -22,11 +22,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -52,7 +52,7 @@ struct AppState {
     workers: Arc<Vec<mpsc::Sender<ModelCommand>>>,
     next_session_id: Arc<AtomicU64>,
     next_worker: Arc<AtomicUsize>,
-    session_workers: Arc<Mutex<HashMap<u64, usize>>>,
+    session_workers: Arc<AsyncMutex<HashMap<u64, usize>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -480,6 +480,7 @@ struct AsyncDecodeRequest {
 struct AsyncDecodeResult {
     request_id: u64,
     waveform: Result<Vec<f32>, String>,
+    decode_elapsed_ms: u64,
 }
 
 /// Background decode thread handle
@@ -492,17 +493,23 @@ struct AsyncDecodeThread {
 
 impl AsyncDecodeThread {
     fn spawn(detokenizer: Arc<Mutex<ort::session::Session>>) -> Self {
-        let (request_tx, request_rx) = std::sync::mpsc::channel();
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (request_tx, request_rx): (std::sync::mpsc::Sender<AsyncDecodeRequest>, _) = std::sync::mpsc::channel();
+        let (result_tx, result_rx): (_, std::sync::mpsc::Receiver<AsyncDecodeResult>) = std::sync::mpsc::channel();
         
         std::thread::Builder::new()
             .name("async-decode".to_string())
             .spawn(move || {
                 while let Ok(req) = request_rx.recv() {
+                    let decode_started = Instant::now();
                     let mut session = detokenizer.lock().unwrap();
                     let waveform = lfm2_audio::decode_audio_codes_standalone(&mut session, &req.codes)
                         .map_err(|e| e.to_string());
-                    if result_tx.send(AsyncDecodeResult { request_id: req.request_id, waveform }).is_err() {
+                    let decode_elapsed_ms = decode_started.elapsed().as_millis() as u64;
+                    if result_tx.send(AsyncDecodeResult { 
+                        request_id: req.request_id, 
+                        waveform,
+                        decode_elapsed_ms,
+                    }).is_err() {
                         break;
                     }
                 }
@@ -521,6 +528,124 @@ impl AsyncDecodeThread {
     
     fn try_recv(&self) -> Option<AsyncDecodeResult> {
         self.result_rx.try_recv().ok()
+    }
+}
+
+/// Async streaming decoder that decodes frames in background thread
+/// while generation continues. Maintains ordering via request IDs.
+struct AsyncStreamingDecoder {
+    async_decode: Arc<AsyncDecodeThread>,
+    session_id: u64,
+    /// Next request ID to assign
+    next_request_id: u64,
+    /// Request IDs in order they were submitted
+    pending_order: VecDeque<u64>,
+    /// Completed results keyed by request_id
+    completed: HashMap<u64, AsyncDecodeResult>,
+    /// Number of samples per frame (1920 at 24kHz)
+    samples_per_frame: usize,
+}
+
+impl AsyncStreamingDecoder {
+    fn new(async_decode: Arc<AsyncDecodeThread>, session_id: u64) -> Self {
+        Self {
+            async_decode,
+            session_id,
+            next_request_id: 0,
+            pending_order: VecDeque::new(),
+            completed: HashMap::new(),
+            samples_per_frame: 1920, // 80ms at 24kHz
+        }
+    }
+    
+    /// Submit a frame for async decode. Returns immediately.
+    /// Call poll_completed() to get results.
+    fn push_frame(&mut self, frame: [u16; 8]) -> ApiResult<()> {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.pending_order.push_back(request_id);
+        
+        // Submit single frame for decode (batch_frames=1, context_frames=0)
+        self.async_decode.request_decode(vec![frame], request_id)?;
+        
+        Ok(())
+    }
+    
+    /// Poll for completed decodes and return chunks in order.
+    /// Returns all completed chunks that are ready in order.
+    fn poll_completed(&mut self) -> ApiResult<Vec<DecodedAudioChunk>> {
+        // Collect all available results
+        while let Some(result) = self.async_decode.try_recv() {
+            self.completed.insert(result.request_id, result);
+        }
+        
+        let mut chunks = Vec::new();
+        
+        // Return completed chunks in order
+        while let Some(&request_id) = self.pending_order.front() {
+            if let Some(result) = self.completed.remove(&request_id) {
+                self.pending_order.pop_front();
+                
+                let waveform = result.waveform
+                    .map_err(|e| ApiError::internal(e))?;
+                
+                let decode_index = request_id as usize + 1;
+                
+                info!(
+                    session_id = self.session_id,
+                    decode_index,
+                    request_id,
+                    decode_elapsed_ms = result.decode_elapsed_ms,
+                    samples = waveform.len(),
+                    "async decode completed"
+                );
+                
+                chunks.push(DecodedAudioChunk {
+                    bytes: encode_pcm_s16le_bytes(&waveform),
+                    decode_index,
+                    emitted_samples: waveform.len(),
+                    decode_elapsed_ms: result.decode_elapsed_ms,
+                    backend: "async-onnx",
+                });
+            } else {
+                // Next in order not ready yet
+                break;
+            }
+        }
+        
+        Ok(chunks)
+    }
+    
+    /// Finish: wait for all pending decodes to complete.
+    /// Returns any remaining chunks in order.
+    fn finish(&mut self) -> ApiResult<Vec<DecodedAudioChunk>> {
+        // Wait for all pending decodes with timeout
+        let timeout = Duration::from_secs(30);
+        let start = Instant::now();
+        
+        while !self.pending_order.is_empty() && start.elapsed() < timeout {
+            // Poll for new results
+            if let Some(result) = self.async_decode.try_recv() {
+                self.completed.insert(result.request_id, result);
+            } else {
+                // Brief sleep to avoid busy-waiting
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            
+            // Check if front of queue is ready
+            if let Some(request_id) = self.pending_order.front() {
+                if self.completed.contains_key(request_id) {
+                    // poll_completed will return this chunk
+                }
+            }
+        }
+        
+        self.poll_completed()
+    }
+    
+    /// Check if there are pending decodes
+    fn has_pending(&self) -> bool {
+        !self.pending_order.is_empty()
     }
 }
 
@@ -804,7 +929,7 @@ async fn main() -> Result<()> {
         workers: Arc::new(workers),
         next_session_id: Arc::new(AtomicU64::new(1)),
         next_worker: Arc::new(AtomicUsize::new(0)),
-        session_workers: Arc::new(Mutex::new(HashMap::new())),
+        session_workers: Arc::new(AsyncMutex::new(HashMap::new())),
     };
 
     let app = build_router(&config, state);
@@ -875,6 +1000,10 @@ fn model_worker(
     interleaved_overrides: InterleavedOverrides,
 ) {
     let mut sessions: HashMap<u64, lfm2_audio::ChatSession<'static>> = HashMap::new();
+    
+    // Create async decode thread for background ONNX inference
+    let audio_detokenizer = model.sessions().audio_detokenizer.clone();
+    let async_decode = Arc::new(AsyncDecodeThread::spawn(audio_detokenizer));
 
     while let Some(command) = rx.blocking_recv() {
         match command {
@@ -950,17 +1079,11 @@ fn model_worker(
                     ))
                 });
                 session.add_user_text(&text);
-                let mut audio_decoder = match StreamingAudioDecoder::new(
-                    model,
-                    stream_decode,
+                // Use async decoder for background ONNX inference
+                let mut audio_decoder = AsyncStreamingDecoder::new(
+                    async_decode.clone(),
                     session_id,
-                ) {
-                    Ok(decoder) => decoder,
-                    Err(err) => {
-                        let _ = reply.send(Err(err));
-                        continue;
-                    }
-                };
+                );
                 let stream_started_at = Instant::now();
                 let mut emitted_audio_chunks = 0usize;
                 let mut emitted_audio_bytes = 0usize;
@@ -992,15 +1115,21 @@ fn model_worker(
                                     frame_gap_ms,
                                     "audio frame generated"
                                 );
-                                if let Some(chunk) = audio_decoder
+                                // Submit frame for async decode (non-blocking)
+                                audio_decoder
                                     .push_frame(frame)
-                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
-                                {
+                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                
+                                // Poll for any completed decodes and send them
+                                let completed = audio_decoder
+                                    .poll_completed()
+                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                
+                                for chunk in completed {
                                     emitted_audio_chunks += 1;
                                     emitted_audio_bytes += chunk.bytes.len();
                                     let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
-                                    first_audio_chunk_at_ms
-                                        .get_or_insert(elapsed_ms);
+                                    first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
                                     info!(
                                         session_id,
                                         chunk_index = emitted_audio_chunks,
@@ -1036,12 +1165,16 @@ fn model_worker(
                     })
                     .map_err(|err| ApiError::internal(err.to_string()))
                     .and_then(|response| {
-                        if let Some(chunk) = audio_decoder.finish()? {
+                        // Finish: wait for all pending async decodes
+                        let final_chunks = audio_decoder
+                            .finish()
+                            .map_err(|err| ApiError::internal(err.message))?;
+                        
+                        for chunk in final_chunks {
                             emitted_audio_chunks += 1;
                             emitted_audio_bytes += chunk.bytes.len();
                             let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
-                            first_audio_chunk_at_ms
-                                .get_or_insert(elapsed_ms);
+                            first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
                             info!(
                                 session_id,
                                 chunk_index = emitted_audio_chunks,
@@ -1105,17 +1238,11 @@ fn model_worker(
                 });
                 let add_result =
                     session.add_user_audio_with_text(&audio, sample_rate, text_prompt.as_deref());
-                let mut audio_decoder = match StreamingAudioDecoder::new(
-                    model,
-                    stream_decode,
+                // Use async decoder for background ONNX inference
+                let mut audio_decoder = AsyncStreamingDecoder::new(
+                    async_decode.clone(),
                     session_id,
-                ) {
-                    Ok(decoder) => decoder,
-                    Err(err) => {
-                        let _ = reply.send(Err(err));
-                        continue;
-                    }
-                };
+                );
                 let stream_started_at = Instant::now();
                 let mut emitted_audio_chunks = 0usize;
                 let mut emitted_audio_bytes = 0usize;
@@ -1150,17 +1277,21 @@ fn model_worker(
                                             frame_gap_ms,
                                             "audio frame generated"
                                         );
-                                        if let Some(chunk) =
-                                            audio_decoder.push_frame(frame).map_err(|err| {
-                                                lfm2_audio::LFM2Error::Generation(err.message)
-                                            })?
-                                        {
+                                        // Submit frame for async decode (non-blocking)
+                                        audio_decoder
+                                            .push_frame(frame)
+                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                        
+                                        // Poll for any completed decodes and send them
+                                        let completed = audio_decoder
+                                            .poll_completed()
+                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                        
+                                        for chunk in completed {
                                             emitted_audio_chunks += 1;
                                             emitted_audio_bytes += chunk.bytes.len();
-                                            let elapsed_ms =
-                                                stream_started_at.elapsed().as_millis() as u64;
-                                            first_audio_chunk_at_ms
-                                                .get_or_insert(elapsed_ms);
+                                            let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
+                                            first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
                                             info!(
                                                 session_id,
                                                 chunk_index = emitted_audio_chunks,
@@ -1196,13 +1327,16 @@ fn model_worker(
                             })
                             .map_err(|err| ApiError::internal(err.to_string()))
                             .and_then(|response| {
-                                if let Some(chunk) = audio_decoder.finish()? {
+                                // Finish: wait for all pending async decodes
+                                let final_chunks = audio_decoder
+                                    .finish()
+                                    .map_err(|err| ApiError::internal(err.message))?;
+                                
+                                for chunk in final_chunks {
                                     emitted_audio_chunks += 1;
                                     emitted_audio_bytes += chunk.bytes.len();
-                                    let elapsed_ms =
-                                        stream_started_at.elapsed().as_millis() as u64;
-                                    first_audio_chunk_at_ms
-                                        .get_or_insert(elapsed_ms);
+                                    let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
+                                    first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
                                     info!(
                                         session_id,
                                         chunk_index = emitted_audio_chunks,
