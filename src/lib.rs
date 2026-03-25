@@ -43,7 +43,6 @@ pub mod tts;
 pub mod interleaved;
 pub mod chat;
 pub mod audio;
-pub mod stream_decode;
 
 // Re-exports
 pub use error::{LFM2Error, Result};
@@ -56,7 +55,6 @@ pub use tts::{TTSPipeline, TTSOptions};
 pub use interleaved::{InterleavedEvent, InterleavedOptions, InterleavedPipeline, InterleavedResponse};
 pub use chat::{ChatSession, AssistantResponse, Turn};
 pub use audio::{compute_mel_spectrogram, decode_wav_bytes, encode_wav_bytes, load_audio, save_audio};
-pub use stream_decode::{discover_default_mimi_checkpoint, discover_mimi_checkpoint_in_hf_root, MimiDecoderTemplate, MimiStreamingDecoder};
 
 // Audio utilities
 pub use audio::mel;

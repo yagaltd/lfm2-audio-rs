@@ -34,8 +34,8 @@ use tower_http::{
 use tracing::{info, warn};
 
 use lfm2_audio::{
-    decode_wav_bytes, discover_default_mimi_checkpoint, encode_wav_bytes, ASROptions, Device,
-    InterleavedOptions, LFM2Audio, MimiDecoderTemplate, Precision, TTSOptions,
+    decode_wav_bytes, encode_wav_bytes, ASROptions, Device,
+    InterleavedOptions, LFM2Audio, Precision, TTSOptions,
 };
 
 const DEFAULT_MODEL_DIR: &str = "/home/aurel/Documents/vibe/STT-rust/LFM2.5-Audio-1.5B-ONNX";
@@ -63,8 +63,6 @@ struct ServerConfig {
     precision: Precision,
     device_preference: DevicePreference,
     cpu_workers: usize,
-    stream_decoder: StreamDecoderPreference,
-    mimi_path: Option<PathBuf>,
     interleaved_n_text: Option<usize>,
     interleaved_n_audio: Option<usize>,
     stream_decode: StreamingDecodeConfig,
@@ -95,12 +93,6 @@ impl StreamingDecodeConfig {
 enum DevicePreference {
     Auto,
     Specific(Device),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamDecoderPreference {
-    Mimi,
-    Onnx,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,12 +140,6 @@ impl ServerConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(1usize);
-        let mut stream_decoder = env::var("LFM2_STREAM_DECODER")
-            .ok()
-            .map(|value| parse_stream_decoder_preference(&value))
-            .transpose()?
-            .unwrap_or(StreamDecoderPreference::Mimi);
-        let mut mimi_path = env::var("LFM2_MIMI_PATH").ok().map(PathBuf::from);
         let mut stream_batch_frames = env::var("LFM2_STREAM_BATCH_FRAMES")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -212,19 +198,6 @@ impl ServerConfig {
                         .parse()
                         .context("invalid --cpu-workers value")?;
                 }
-                "--stream-decoder" => {
-                    stream_decoder = parse_stream_decoder_preference(
-                        &args
-                            .next()
-                            .ok_or_else(|| anyhow!("missing value for --stream-decoder"))?,
-                    )?;
-                }
-                "--mimi-path" => {
-                    mimi_path = Some(PathBuf::from(
-                        args.next()
-                            .ok_or_else(|| anyhow!("missing value for --mimi-path"))?,
-                    ));
-                }
                 "--stream-batch-frames" => {
                     stream_batch_frames = args
                         .next()
@@ -266,8 +239,6 @@ impl ServerConfig {
             precision,
             device_preference,
             cpu_workers,
-            stream_decoder,
-            mimi_path,
             interleaved_n_text,
             interleaved_n_audio,
             stream_decode: StreamingDecodeConfig::new(
@@ -287,28 +258,6 @@ fn parse_device_preference(value: &str) -> Result<DevicePreference> {
         "directml" => Ok(DevicePreference::Specific(Device::DirectML)),
         "tensorrt" => Ok(DevicePreference::Specific(Device::TensorRT)),
         other => Err(anyhow!("unknown device: {}", other)),
-    }
-}
-
-fn parse_stream_decoder_preference(value: &str) -> Result<StreamDecoderPreference> {
-    match value.to_ascii_lowercase().as_str() {
-        "mimi" => Ok(StreamDecoderPreference::Mimi),
-        "onnx" => Ok(StreamDecoderPreference::Onnx),
-        other => Err(anyhow!(
-            "unsupported --stream-decoder value '{}'; expected one of: mimi, onnx",
-            other
-        )),
-    }
-}
-
-fn resolve_mimi_checkpoint(explicit: Option<PathBuf>) -> ApiResult<PathBuf> {
-    match explicit {
-        Some(path) if path.is_file() => Ok(path),
-        Some(path) => Err(ApiError::internal(format!(
-            "configured Mimi checkpoint not found: {}",
-            path.display()
-        ))),
-        None => discover_default_mimi_checkpoint().map_err(|err| ApiError::internal(err.to_string())),
     }
 }
 
@@ -529,6 +478,8 @@ struct OnnxStreamingAudioDecoder<'a> {
     context_frames: usize,
     session_id: u64,
     decode_index: usize,
+    /// Number of samples already emitted (avoids re-decoding context)
+    last_emitted_samples: usize,
 }
 
 impl<'a> OnnxStreamingAudioDecoder<'a> {
@@ -541,6 +492,7 @@ impl<'a> OnnxStreamingAudioDecoder<'a> {
             context_frames: config.context_frames,
             session_id,
             decode_index: 0,
+            last_emitted_samples: 0,
         }
     }
 
@@ -577,26 +529,17 @@ impl<'a> OnnxStreamingAudioDecoder<'a> {
 
         let full_decode_ms = decode_started_at.elapsed().as_millis() as u64;
 
-        // Calculate slice point by re-decoding the context portion
-        // This is necessary because the LFM2.5 detokenizer uses complex upsampling
-        // and attention that makes simple sample offset calculation unreliable
-        let (new_waveform, context_decode_ms) = if flushed_frames == 0 {
+        // Slice off new portion using cached sample position
+        // No re-decode needed - we track where we left off
+        let (new_waveform, context_decode_ms) = if self.last_emitted_samples == 0 {
             (waveform, 0)
         } else {
-            let context_decode_started_at = Instant::now();
-            let context_waveform = self
-                .tts
-                .decode_audio_codes_raw(&self.all_codes[..flushed_frames])
-                .map_err(|err| ApiError::internal(err.to_string()))?;
-            let context_decode_ms = context_decode_started_at.elapsed().as_millis() as u64;
-
-            if context_waveform.len() >= waveform.len() {
+            if self.last_emitted_samples >= waveform.len() {
                 return Err(ApiError::internal(
                     "streaming detokenizer produced no new waveform tail",
                 ));
             }
-
-            (waveform[context_waveform.len()..].to_vec(), context_decode_ms)
+            (waveform[self.last_emitted_samples..].to_vec(), 0)
         };
 
         self.retain_recent_context();
@@ -637,101 +580,38 @@ impl<'a> OnnxStreamingAudioDecoder<'a> {
     fn retain_recent_context(&mut self) {
         let keep_start = self.all_codes.len().saturating_sub(self.context_frames);
         if keep_start > 0 {
+            // When draining frames, adjust last_emitted_samples
+            // Each frame = 1920 samples (80ms at 24kHz)
+            const SAMPLES_PER_FRAME: usize = 1920;
+            let drained_samples = keep_start * SAMPLES_PER_FRAME;
+            self.last_emitted_samples = self.last_emitted_samples.saturating_sub(drained_samples);
             self.all_codes.drain(..keep_start);
         }
         self.flushed_frames = self.all_codes.len();
     }
 }
 
-enum StreamingAudioDecoder<'a> {
-    Mimi {
-        decoder: lfm2_audio::MimiStreamingDecoder,
-        session_id: u64,
-        decode_index: usize,
-    },
-    Onnx(OnnxStreamingAudioDecoder<'a>),
-}
+struct StreamingAudioDecoder<'a>(OnnxStreamingAudioDecoder<'a>);
 
 impl<'a> StreamingAudioDecoder<'a> {
     fn new(
         model: &'a LFM2Audio,
-        preference: StreamDecoderPreference,
         onnx_config: StreamingDecodeConfig,
         session_id: u64,
-        mimi_template: Option<&MimiDecoderTemplate>,
     ) -> ApiResult<Self> {
-        match preference {
-            StreamDecoderPreference::Mimi => {
-                let template = mimi_template.ok_or_else(|| {
-                    ApiError::internal("Mimi streaming decoder requested but no template is loaded")
-                })?;
-                // Create fresh decoder with reset state for each turn
-                let mut decoder = template.new_streaming_decoder();
-                decoder.reset(); // Ensure clean state
-                Ok(Self::Mimi {
-                    decoder,
-                    session_id,
-                    decode_index: 0,
-                })
-            }
-            StreamDecoderPreference::Onnx => Ok(Self::Onnx(OnnxStreamingAudioDecoder::new(
-                model,
-                onnx_config,
-                session_id,
-            ))),
-        }
-    }
-
-    #[cfg(test)]
-    fn new_mimi(mimi_path: PathBuf, session_id: u64) -> ApiResult<Self> {
-        let decoder = lfm2_audio::MimiStreamingDecoder::from_checkpoint(mimi_path)
-            .map_err(|err| ApiError::internal(err.to_string()))?;
-        Ok(Self::Mimi {
-            decoder,
+        Ok(Self(OnnxStreamingAudioDecoder::new(
+            model,
+            onnx_config,
             session_id,
-            decode_index: 0,
-        })
+        )))
     }
 
     fn push_frame(&mut self, frame: [u16; 8]) -> ApiResult<Option<DecodedAudioChunk>> {
-        match self {
-            Self::Mimi {
-                decoder,
-                session_id,
-                decode_index,
-            } => {
-                let decode_started_at = Instant::now();
-                let waveform = decoder
-                    .push_frame(frame)
-                    .map_err(|err| ApiError::internal(err.to_string()))?;
-                *decode_index += 1;
-                if waveform.is_empty() {
-                    return Ok(None);
-                }
-                info!(
-                    session_id = *session_id,
-                    decode_index = *decode_index,
-                    emitted_samples = waveform.len(),
-                    total_decode_ms = decode_started_at.elapsed().as_millis() as u64,
-                    "streaming Mimi decode step"
-                );
-                Ok(Some(DecodedAudioChunk {
-                    bytes: encode_pcm_s16le_bytes(&waveform),
-                    decode_index: *decode_index,
-                    emitted_samples: waveform.len(),
-                    decode_elapsed_ms: decode_started_at.elapsed().as_millis() as u64,
-                    backend: "mimi",
-                }))
-            }
-            Self::Onnx(decoder) => decoder.push_frame(frame),
-        }
+        self.0.push_frame(frame)
     }
 
     fn finish(&mut self) -> ApiResult<Option<DecodedAudioChunk>> {
-        match self {
-            Self::Mimi { .. } => Ok(None),
-            Self::Onnx(decoder) => decoder.finish(),
-        }
+        self.0.finish()
     }
 }
 
@@ -827,37 +707,26 @@ async fn main() -> Result<()> {
     }
 
     info!(
-        "Loading model from {} with precision {:?} on {:?} using {} worker(s), stream_decoder={:?}, interleaved_n_text={:?}, interleaved_n_audio={:?}, stream_batch_frames={}, stream_context_frames={}",
+        "Loading model from {} with precision {:?} on {:?} using {} worker(s), interleaved_n_text={:?}, interleaved_n_audio={:?}, stream_batch_frames={}, stream_context_frames={}",
         config.model_path.display(),
         config.precision,
         device,
         worker_count,
-        config.stream_decoder,
         config.interleaved_n_text,
         config.interleaved_n_audio,
         config.stream_decode.batch_frames,
         config.stream_decode.context_frames,
     );
 
-    let resolved_mimi_path = match config.stream_decoder {
-        StreamDecoderPreference::Mimi => Some(
-            resolve_mimi_checkpoint(config.mimi_path.clone())
-                .map_err(|err| anyhow!(err.message))?,
-        ),
-        StreamDecoderPreference::Onnx => None,
-    };
-
     let mut workers = Vec::with_capacity(worker_count);
     for worker_index in 0..worker_count {
         let model_path = config.model_path.clone();
         let precision = config.precision;
-        let stream_decoder = config.stream_decoder;
         let stream_decode = config.stream_decode;
         let interleaved_overrides = InterleavedOverrides {
             n_text: config.interleaved_n_text,
             n_audio: config.interleaved_n_audio,
         };
-        let mimi_path = resolved_mimi_path.clone();
         let (tx, rx) = mpsc::channel(32);
         std::thread::Builder::new()
             .name(format!("lfm2-worker-{}", worker_index))
@@ -866,24 +735,11 @@ async fn main() -> Result<()> {
                     LFM2Audio::from_pretrained(&model_path, precision, device)
                         .expect("failed to load worker model"),
                 ));
-                let mimi_template = match stream_decoder {
-                    StreamDecoderPreference::Mimi => Some(
-                        MimiDecoderTemplate::from_checkpoint(
-                            mimi_path
-                                .as_ref()
-                                .expect("resolved Mimi path should exist for Mimi backend"),
-                        )
-                        .expect("failed to load worker Mimi template"),
-                    ),
-                    StreamDecoderPreference::Onnx => None,
-                };
                 model_worker(
                     model,
                     rx,
-                    stream_decoder,
                     stream_decode,
                     interleaved_overrides,
-                    mimi_template,
                 );
             })
             .map_err(|err| anyhow!("failed to spawn worker thread: {}", err))?;
@@ -961,10 +817,8 @@ async fn close_session_worker(state: &AppState, session_id: u64) -> Option<usize
 fn model_worker(
     model: &'static LFM2Audio,
     mut rx: mpsc::Receiver<ModelCommand>,
-    stream_decoder: StreamDecoderPreference,
     stream_decode: StreamingDecodeConfig,
     interleaved_overrides: InterleavedOverrides,
-    mimi_template: Option<MimiDecoderTemplate>,
 ) {
     let mut sessions: HashMap<u64, lfm2_audio::ChatSession<'static>> = HashMap::new();
 
@@ -1044,10 +898,8 @@ fn model_worker(
                 session.add_user_text(&text);
                 let mut audio_decoder = match StreamingAudioDecoder::new(
                     model,
-                    stream_decoder,
                     stream_decode,
                     session_id,
-                    mimi_template.as_ref(),
                 ) {
                     Ok(decoder) => decoder,
                     Err(err) => {
@@ -1201,10 +1053,8 @@ fn model_worker(
                     session.add_user_audio_with_text(&audio, sample_rate, text_prompt.as_deref());
                 let mut audio_decoder = match StreamingAudioDecoder::new(
                     model,
-                    stream_decoder,
                     stream_decode,
                     session_id,
-                    mimi_template.as_ref(),
                 ) {
                     Ok(decoder) => decoder,
                     Err(err) => {
@@ -2033,9 +1883,8 @@ fn resolve_tts_system_prompt(system_prompt: Option<&str>, voice: Option<&str>) -
 mod tests {
     use super::{
         background_worker_index, chunk_playback_duration, effective_worker_count,
-        parse_device_preference, parse_stream_decoder_preference, resolve_mimi_checkpoint,
+        parse_device_preference,
         AudioOutputPacer, Device, DevicePreference, OutputQueueConfig, StreamingAudioDecoder,
-        StreamDecoderPreference,
     };
     use lfm2_audio::{LFM2Audio, Precision, TTSOptions};
     use std::path::PathBuf;
@@ -2056,14 +1905,6 @@ mod tests {
         assert!(matches!(
             parse_device_preference("auto").expect("auto should parse"),
             DevicePreference::Auto
-        ));
-    }
-
-    #[test]
-    fn parse_stream_decoder_preference_accepts_mimi() {
-        assert!(matches!(
-            parse_stream_decoder_preference("mimi").expect("mimi should parse"),
-            StreamDecoderPreference::Mimi
         ));
     }
 
@@ -2141,18 +1982,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mimi_checkpoint_uses_explicit_path() {
-        let checkpoint = PathBuf::from(
-            "/home/aurel/.cache/huggingface/hub/models--LiquidAI--LFM2.5-Audio-1.5B/snapshots/9050188b02f87417911b9b3a40212e1efaebb393/tokenizer-e351c8d8-checkpoint125.safetensors",
-        );
-        let resolved = resolve_mimi_checkpoint(Some(checkpoint.clone()))
-            .expect("explicit Mimi checkpoint should be accepted");
-        assert_eq!(resolved, checkpoint);
-    }
-
-    #[test]
     #[ignore = "requires model files and is slow"]
-    fn streaming_audio_decoder_mimi_matches_native_batch_decode() {
+    fn streaming_audio_decoder_onnx_produces_audio() {
         let model = load_model();
         let options = TTSOptions {
             max_new_tokens: 48,
@@ -2172,34 +2003,29 @@ mod tests {
         );
         let audio_codes: Vec<[u16; 8]> = debug.audio_codes.iter().take(8).copied().collect();
 
-        let mimi_path = resolve_mimi_checkpoint(None).expect("Mimi checkpoint should resolve");
-        let mut decoder = StreamingAudioDecoder::new_mimi(mimi_path, 0)
-            .expect("Mimi streaming decoder should load");
+        let mut decoder = StreamingAudioDecoder::new(
+            &model,
+            super::StreamingDecodeConfig::new(4, 16),
+            0,
+        )
+        .expect("ONNX streaming decoder should load");
         let mut streamed_bytes = Vec::new();
         for frame in &audio_codes {
-            let chunk = decoder
+            if let Some(chunk) = decoder
                 .push_frame(*frame)
                 .expect("push_frame should succeed")
-                .expect("Mimi step decode should emit one PCM chunk per frame");
+            {
+                streamed_bytes.extend_from_slice(&chunk.bytes);
+            }
+        }
+
+        if let Some(chunk) = decoder.finish().expect("finish should succeed") {
             streamed_bytes.extend_from_slice(&chunk.bytes);
         }
 
-        let maybe_final = decoder.finish().expect("finish should succeed");
         assert!(
-            maybe_final.is_none(),
-            "Mimi streaming decoder should not require a buffered final flush"
-        );
-
-        let reference_audio = lfm2_audio::MimiStreamingDecoder::decode_all(
-            resolve_mimi_checkpoint(None).expect("Mimi checkpoint should resolve"),
-            &audio_codes,
-        )
-        .expect("native Mimi batch decode should succeed");
-        let reference_pcm = super::encode_pcm_s16le_bytes(&reference_audio);
-        assert_eq!(
-            streamed_bytes.len(),
-            reference_pcm.len(),
-            "streamed Mimi PCM should match the native Mimi batch decode length"
+            !streamed_bytes.is_empty(),
+            "ONNX streaming decoder should produce audio"
         );
     }
 }
