@@ -2,7 +2,7 @@
 
 ## Completed Optimizations (2025-03-25)
 
-Best achieved: **max_frame_gap 324-346ms, RTF ~1.0**
+Best achieved: **max_frame_gap 324-346ms, RTF ~0.92-1.0**
 
 | Optimization | Impact |
 |-------------|--------|
@@ -21,74 +21,35 @@ Best achieved: **max_frame_gap 324-346ms, RTF ~1.0**
 | inter_threads=2 | No improvement | Not helpful |
 | Q8 precision | 428ms, RTF 1.10 | Larger model, worse performance |
 | FP16 precision | Timeout | Much larger model, very slow |
+| queue_chunks=8 | RTF 0.915 | Better RTF, max gap unchanged |
 
 ## Optimization Limit Reached
 
 Within the constraints (no new dependencies, maintain API compatibility, CPU-only), the best achievable is:
 - **Max frame gap: 324-346ms** (78% improvement from 1500ms baseline)
-- **RTF: 0.97-1.02** (at or near real-time)
+- **RTF: 0.92-1.0** (at or near real-time)
 
-The target of <30ms max gap cannot be achieved without:
-1. **Async decode pipeline** (architectural change)
-2. **GPU acceleration** (hardware requirement)
+The target of <30ms max gap cannot be achieved without architectural changes.
 
-## Future Ideas (Require Constraints Change)
+## Why <30ms is Not Achievable
 
-### High Impact (Architectural Changes)
+The math:
+- LLM generates frames at ~50ms intervals
+- ONNX decode takes ~72ms per frame
+- Each frame accumulates 22ms delay
+- After 15 frames: 15 × 22 = 330ms (matches observed max gap)
 
-1. **Async Decode Pipeline**
-   - Run ONNX inference in blocking thread pool
-   - Decode next batch while sending current audio
-   - Would require tokio::task::spawn_blocking
-   - Expected improvement: 50-70% reduction in max gap
-   - Effort: High (significant refactoring)
-   - **No new dependencies required** - tokio already used
+To achieve <30ms would require either:
+1. **GPU decode** (<10ms per frame)
+2. **Async decode pipeline** (hide latency behind generation)
+3. **Smaller/faster model** (not available)
 
-2. **GPU Acceleration**
-   - Use CUDA/CoreML/DirectML execution providers
-   - ONNX Runtime supports GPU inference
-   - Would require CUDA-enabled hardware
-   - Expected improvement: 5-10x faster decode
-   - Effort: Medium (add feature flag, hardware dependency)
+## Async Decode Requirements
 
-### Medium Impact (Requires Dependencies)
+Analysis showed async decode would require:
+1. Change `RefCell<Session>` to `Mutex<Session>` in sessions.rs
+2. Create decode thread pool
+3. Use channels for async communication
+4. Maintain decode ordering
 
-3. **Thread-affinity for ONNX Threads**
-   - Pin ONNX intra threads to specific cores
-   - Reduce context switch overhead
-   - Would require `core_affinity` crate
-   - **Blocked by: No new dependencies constraint**
-
-### Low Impact (Already Optimized)
-
-4. **ONNX Graph Optimization**
-   - Already using GraphOptimizationLevel::Level3
-   - No further improvement possible
-
-5. **Memory Pre-allocation**
-   - Minimal impact compared to ONNX inference time
-
-## Constraints
-
-- No new dependencies allowed
-- Must maintain API compatibility
-- Tests must pass
-- Must work with existing ONNX models (Q4 quantization is optimal)
-
-## Hardware Requirements for <30ms Target
-
-Current: 72ms decode per frame on CPU
-Target: <30ms max gap
-
-Options:
-1. **CUDA GPU** - Would likely achieve <10ms decode
-2. **Apple Silicon (CoreML)** - Could achieve ~20-30ms decode
-3. **Async pipeline** - Would hide decode latency behind transmission
-
-## Recommendation
-
-The most practical path forward is implementing an **async decode pipeline**:
-- No new dependencies (uses existing tokio)
-- Could reduce max gap by 50-70%
-- Would allow audio streaming while next batch decodes
-- Implementation: Use `tokio::task::spawn_blocking` for ONNX inference
+This is significant but achievable refactoring (no new dependencies).
