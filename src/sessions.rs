@@ -3,6 +3,7 @@
 
 use ort::session::builder::GraphOptimizationLevel;
 use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 
 use crate::config::{Device, Precision};
@@ -10,6 +11,7 @@ use crate::error::{LFM2Error, Result};
 
 /// Container for all LFM2.5 ONNX sessions
 /// Uses RefCell for interior mutability since session.run() requires &mut self
+/// Audio detokenizer uses Arc<Mutex> for async decode support
 pub struct LFM2Sessions {
     /// Audio encoder: mel → audio embeddings
     pub audio_encoder: RefCell<ort::session::Session>,
@@ -17,8 +19,8 @@ pub struct LFM2Sessions {
     pub decoder: RefCell<ort::session::Session>,
     /// Depthformer: audio codebook prediction
     pub depthformer: RefCell<ort::session::Session>,
-    /// Audio detokenizer: codes → STFT → waveform
-    pub audio_detokenizer: RefCell<ort::session::Session>,
+    /// Audio detokenizer: codes → STFT → waveform (thread-safe for async decode)
+    pub audio_detokenizer: Arc<Mutex<ort::session::Session>>,
     /// Audio embedding (optional - can use binary lookup instead)
     pub audio_embedding: Option<RefCell<ort::session::Session>>,
 }
@@ -70,7 +72,7 @@ impl SessionLoader {
             audio_encoder: RefCell::new(audio_encoder),
             decoder: RefCell::new(decoder),
             depthformer: RefCell::new(depthformer),
-            audio_detokenizer: RefCell::new(audio_detokenizer),
+            audio_detokenizer: Arc::new(Mutex::new(audio_detokenizer)),
             audio_embedding: audio_embedding.map(RefCell::new),
         })
     }

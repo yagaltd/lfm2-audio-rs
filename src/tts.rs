@@ -537,7 +537,7 @@ impl<'a> TTSPipeline<'a> {
         let t_codes = ort::value::Value::from_array(codes_contig)?;
 
         // Run audio detokenizer
-        let mut detokenizer = self.model.sessions.audio_detokenizer.borrow_mut();
+        let mut detokenizer = self.model.sessions.audio_detokenizer.lock().unwrap();
         let outputs = detokenizer.run(ort::inputs! {
             "audio_codes" => t_codes,
         })?;
