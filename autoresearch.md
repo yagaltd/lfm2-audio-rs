@@ -59,22 +59,37 @@ All source files may be modified:
 5. Server must remain stable under load
 
 ## Baseline Metrics
-(To be filled after first run)
+- Initial (before optimization): `max_frame_gap_ms` ~1500ms
+- After Moshi removal + context tracking: ~1500ms (same, but eliminated redundant context decode)
+- After batch_frames=1: ~1200ms
+- After context_frames=0: ~519ms
+- **Current (batch_frames=1, context_frames=0)**: `max_frame_gap_ms` **305ms**
 
 ## What's Been Tried
-(Update as experiments accumulate)
 
-### Current Architecture
-- Streaming decoder batches 4 frames before decoding (`stream_decode_batch_frames=4`)
-- Uses sliding window of 16 context frames for quality (`stream_decode_context_frames=16`)
-- Each frame is ~80ms of audio (1920 samples at 24kHz)
-- Decoding re-processes context frames every batch (potential optimization target)
+### Completed Optimizations
+1. **Removed Moshi/Candle dependency** - Eliminated redundant audio decode pipeline
+2. **Track last_emitted_samples** - Avoid re-decoding context frames to find slice position
+3. **Set batch_frames=1** - Decode each frame immediately, reducing batch latency
+4. **Set context_frames=0** - Eliminate window growth, decode only pending frames
+5. **Fixed tests** - Removed Mimi-specific tests after dependency removal
 
-### Potential Optimizations
-1. **Reduce batch size** - smaller batches = lower latency but more overhead
-2. **Parallel decode** - decode next batch while sending current
-3. **Context caching** - avoid re-decoding the same context frames
-4. **WebSocket batching** - send multiple small chunks together
-5. **Pre-buffering** - generate ahead during text-only phases
-6. **ONNX session optimization** - graph optimizations, memory patterns
-7. **Frame interpolation** - smooth over small gaps client-side
+### Results Summary
+| Config | Max Gap | RTF | Notes |
+|--------|----------|-----|-------|
+| Baseline (batch=4, ctx=16) | ~1500ms | ? | Window grows to 17 frames |
+| batch=1 | ~1200ms | ? | Marginally better |
+| ctx=0 | ~519ms | ? | Major improvement |
+| **batch=1, ctx=0** | **305ms** | **0.986** | **80% improvement** |
+
+### Remaining Bottleneck
+- Decode latency ~69ms per frame, but frames arrive every ~50ms
+- Max gap 305ms still above 30ms target
+- Need parallel decode/generate pipeline or smaller frame sizes
+
+### Potential Future Optimizations
+1. **Parallel decode** - decode next batch while sending current (requires async pipeline)
+2. **Pre-buffering** - start audio decode during text generation phase
+3. **ONNX thread optimization** - tune intra_op_num_threads for parallel execution
+4. **Frame interpolation** - smooth over small gaps client-side
+5. **Smaller frame sizes** - if model supports finer granularity
