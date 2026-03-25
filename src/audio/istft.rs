@@ -183,7 +183,7 @@ mod tests {
         let duration = 0.1;
         let num_samples = (sample_rate as f32 * duration) as usize;
 
-        let sine: Vec<f32> = (0..num_samples)
+        let _sine: Vec<f32> = (0..num_samples)
             .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate as f32).sin())
             .collect();
 

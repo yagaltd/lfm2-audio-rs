@@ -125,7 +125,7 @@ pub struct AudioEmbedding {
 /// Metadata for audio_embedding
 #[derive(Debug, Clone, serde::Deserialize)]
 struct AudioEmbeddingMeta {
-    #[serde(rename = "codebooks")]
+    #[serde(rename = "codebooks", alias = "num_codebooks")]
     codebooks: usize,
     #[serde(rename = "codebook_vocab")]
     codebook_vocab: usize,
@@ -190,25 +190,20 @@ impl AudioEmbedding {
         &self.weight[offset..offset + self.hidden_size]
     }
     
-    /// Get averaged embedding across all codebooks for a frame of codes
+    /// Get summed embedding across all codebooks for a frame of codes
     /// codes: [codebook_0, codebook_1, ..., codebook_7]
-    /// Returns: averaged embedding of length hidden_size
+    /// Returns: summed embedding of length hidden_size
     pub fn lookup_codes(&self, codes: &[u16; 8]) -> Vec<f32> {
         let mut result = vec![0.0f32; self.hidden_size];
         
-        // Average embeddings across codebooks
+        // Sum embeddings across codebooks (matches reference implementation).
         for (cb_idx, &token_id) in codes.iter().enumerate() {
             let emb = self.lookup_single(cb_idx, token_id);
             for i in 0..self.hidden_size {
                 result[i] += emb[i];
             }
         }
-        
-        // Divide by number of codebooks
-        for i in 0..self.hidden_size {
-            result[i] /= self.codebooks as f32;
-        }
-        
+
         result
     }
     

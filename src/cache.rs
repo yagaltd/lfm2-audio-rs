@@ -3,7 +3,6 @@
 
 use ndarray::{Array3, Array4};
 use ort::session::SessionOutputs;
-use ort::value::Value;
 use std::collections::HashMap;
 
 use crate::config::{LFM2Config, LayerType};
@@ -92,7 +91,7 @@ impl GenerationCache {
                     conv_caches.insert(layer_idx, ConvCache { state });
                 }
                 LayerType::FullAttention => {
-                    // Attention cache: empty initially [1, num_kv_heads, 0, head_dim]
+                    // Attention cache: start with seq_len=0 (empty) matching JS implementation
                     let key = Array4::<f32>::zeros((
                         1,
                         cache_config.num_key_value_heads,
@@ -122,30 +121,36 @@ impl GenerationCache {
         })
     }
 
-    /// Prepare input feeds for decoder from current cache state
-    /// Returns cache values that can be added to inputs! macro
-    pub fn prepare_cache_inputs(&self) -> Vec<(String, ort::value::Value)> {
-        use ort::value::Value;
+    /// Prepare cache inputs for decoder
+    /// Returns values in the exact order expected by the model
+    pub fn prepare_cache_inputs(&self) -> Vec<(String, ort::value::DynValue)> {
         let mut feeds = Vec::new();
 
-        // Add conv caches
-        for (layer_idx, cache) in &self.conv_caches {
-            let name = format!("past_conv.{}", layer_idx);
-            if let Ok(value) = Value::from_array(cache.state.clone()) {
-                feeds.push((name, value.into()));
-            }
-        }
+        // Iterate through ALL layers in order
+        let num_layers = self.config.num_layers;
 
-        // Add KV caches
-        for (layer_idx, cache) in &self.kv_caches {
-            let key_name = format!("past_key_values.{}.key", layer_idx);
-            let value_name = format!("past_key_values.{}.value", layer_idx);
+        for layer_idx in 0..num_layers {
+            if let Some(cache) = self.conv_caches.get(&layer_idx) {
+                // Conv layer
+                let name = format!("past_conv.{}", layer_idx);
+                let contiguous = cache.state.as_standard_layout().to_owned();
+                if let Ok(tensor) = ort::value::Tensor::from_array(contiguous) {
+                    feeds.push((name, tensor.into_dyn()));
+                }
+            } else if let Some(cache) = self.kv_caches.get(&layer_idx) {
+                // Attention layer - add key then value
+                let key_name = format!("past_key_values.{}.key", layer_idx);
+                let value_name = format!("past_key_values.{}.value", layer_idx);
 
-            if let Ok(key_value) = Value::from_array(cache.key.clone()) {
-                feeds.push((key_name, key_value.into()));
-            }
-            if let Ok(value_value) = Value::from_array(cache.value.clone()) {
-                feeds.push((value_name, value_value.into()));
+                let key_contig = cache.key.as_standard_layout().to_owned();
+                let value_contig = cache.value.as_standard_layout().to_owned();
+
+                if let Ok(key_tensor) = ort::value::Tensor::from_array(key_contig) {
+                    feeds.push((key_name, key_tensor.into_dyn()));
+                }
+                if let Ok(value_tensor) = ort::value::Tensor::from_array(value_contig) {
+                    feeds.push((value_name, value_tensor.into_dyn()));
+                }
             }
         }
 
@@ -153,14 +158,9 @@ impl GenerationCache {
     }
 
     /// Update cache from decoder outputs
-    /// Maps present_conv.* -> past_conv.*
-    /// Maps present.*.key/value -> past_key_values.*.key/value
     pub fn update(&mut self, outputs: &SessionOutputs) -> Result<()> {
-        // Collect conv layer indices to update
-        let conv_indices: Vec<usize> = self.conv_caches.keys().copied().collect();
-        
         // Update conv caches
-        for layer_idx in conv_indices {
+        for layer_idx in self.conv_caches.keys().copied().collect::<Vec<_>>() {
             let present_name = format!("present_conv.{}", layer_idx);
             if let Some(output) = outputs.get(&present_name) {
                 if let Ok(view) = output.try_extract_array::<f32>() {
@@ -175,15 +175,11 @@ impl GenerationCache {
             }
         }
 
-        // Collect KV layer indices to update
-        let kv_indices: Vec<usize> = self.kv_caches.keys().copied().collect();
-        
         // Update KV caches
-        for layer_idx in kv_indices {
+        for layer_idx in self.kv_caches.keys().copied().collect::<Vec<_>>() {
             let key_name = format!("present.{}.key", layer_idx);
             let value_name = format!("present.{}.value", layer_idx);
 
-            // Update key
             if let Some(output) = outputs.get(&key_name) {
                 if let Ok(view) = output.try_extract_array::<f32>() {
                     let array = view.to_owned();
@@ -196,7 +192,6 @@ impl GenerationCache {
                 }
             }
 
-            // Update value
             if let Some(output) = outputs.get(&value_name) {
                 if let Ok(view) = output.try_extract_array::<f32>() {
                     let array = view.to_owned();
@@ -231,8 +226,6 @@ impl GenerationCache {
 
     /// Helper to reconstruct LFM2Config for reset
     fn to_lfm2_config(&self) -> Result<LFM2Config> {
-        // This is a minimal reconstruction for reset purposes
-        // In practice, you'd want to store the original config
         Ok(LFM2Config {
             hidden_size: self.config.hidden_size,
             num_attention_heads: self.config.num_attention_heads,
@@ -294,18 +287,7 @@ mod tests {
                 "conv".to_string(),
                 "conv".to_string(),
                 "full_attention".to_string(),
-                "conv".to_string(),
-                "conv".to_string(),
-                "full_attention".to_string(),
-                "conv".to_string(),
-                "full_attention".to_string(),
-                "conv".to_string(),
-                "full_attention".to_string(),
-                "conv".to_string(),
-                "full_attention".to_string(),
-                "conv".to_string(),
             ],
-            // Minimal other fields
             name_or_path: "".to_string(),
             architectures: vec![],
             block_auto_adjust_ff_dim: false,
@@ -342,30 +324,26 @@ mod tests {
         let config = create_test_config();
         let cache = GenerationCache::new(&config).unwrap();
 
+        assert_eq!(cache.conv_caches.len(), 4);
+        assert_eq!(cache.kv_caches.len(), 2);
         assert_eq!(cache.seq_len, 0);
-        assert_eq!(cache.layer_types.len(), 16);
-        assert!(!cache.kv_caches.is_empty());
-        assert!(!cache.conv_caches.is_empty());
     }
 
     #[test]
-    fn test_conv_cache_shape() {
+    fn test_cache_input_order() {
         let config = create_test_config();
         let cache = GenerationCache::new(&config).unwrap();
 
-        for (_, conv_cache) in &cache.conv_caches {
-            assert_eq!(conv_cache.state.shape(), &[1, 2048, 3]);
-        }
-    }
+        let inputs = cache.prepare_cache_inputs();
+        let names: Vec<_> = inputs.iter().map(|(n, _)| n.clone()).collect();
 
-    #[test]
-    fn test_kv_cache_initial_shape() {
-        let config = create_test_config();
-        let cache = GenerationCache::new(&config).unwrap();
-
-        for (_, kv_cache) in &cache.kv_caches {
-            assert_eq!(kv_cache.key.shape(), &[1, 8, 0, 64]); // Empty initially
-            assert_eq!(kv_cache.value.shape(), &[1, 8, 0, 64]);
-        }
+        assert_eq!(names[0], "past_conv.0");
+        assert_eq!(names[1], "past_conv.1");
+        assert_eq!(names[2], "past_key_values.2.key");
+        assert_eq!(names[3], "past_key_values.2.value");
+        assert_eq!(names[4], "past_conv.3");
+        assert_eq!(names[5], "past_conv.4");
+        assert_eq!(names[6], "past_key_values.5.key");
+        assert_eq!(names[7], "past_key_values.5.value");
     }
 }

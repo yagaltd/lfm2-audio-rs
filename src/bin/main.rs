@@ -2,9 +2,10 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use lfm2_audio::{ASROptions, Device, LFM2Audio, Precision, TTSOptions};
+use lfm2_audio::{ASROptions, Device, InterleavedOptions, LFM2Audio, Precision, TTSOptions};
 
 #[derive(Parser)]
 #[command(name = "lfm2-audio")]
@@ -107,7 +108,41 @@ enum Commands {
         audio_temp: f32,
     },
     /// Chat with interleaved audio/text
-    Chat,
+    Chat {
+        /// Base output audio file for assistant audio turns
+        #[arg(short, long, default_value = "chat_output.wav")]
+        output: PathBuf,
+        /// System prompt
+        #[arg(short = 's', long)]
+        system_prompt: Option<String>,
+    },
+    /// Single-turn interleaved text/audio generation
+    Interleaved {
+        /// Text prompt
+        #[arg(long, conflicts_with = "audio")]
+        prompt: Option<String>,
+        /// Input audio file
+        #[arg(long, conflicts_with = "prompt")]
+        audio: Option<PathBuf>,
+        /// Output audio file (WAV)
+        #[arg(short, long, default_value = "interleaved_output.wav")]
+        output: PathBuf,
+        /// System prompt
+        #[arg(short = 's', long)]
+        system_prompt: Option<String>,
+        /// Max tokens/frames
+        #[arg(short, long, default_value = "300")]
+        max_tokens: usize,
+        /// Text temperature
+        #[arg(long, default_value = "1.0")]
+        text_temp: f32,
+        /// Audio temperature
+        #[arg(long, default_value = "1.0")]
+        audio_temp: f32,
+        /// Audio top-k
+        #[arg(long, default_value = "4")]
+        audio_top_k: usize,
+    },
     /// Show model info
     Info,
 }
@@ -123,8 +158,23 @@ fn main() -> Result<()> {
         Commands::Tts { text, output, voice, max_tokens, text_temp, audio_temp } => {
             cmd_tts(&cli.model, cli.precision.into(), cli.device.into(), text, output, voice, max_tokens, text_temp, audio_temp)
         }
-        Commands::Chat => {
-            cmd_chat(&cli.model, cli.precision.into(), cli.device.into())
+        Commands::Chat { output, system_prompt } => {
+            cmd_chat(&cli.model, cli.precision.into(), cli.device.into(), output, system_prompt)
+        }
+        Commands::Interleaved { prompt, audio, output, system_prompt, max_tokens, text_temp, audio_temp, audio_top_k } => {
+            cmd_interleaved(
+                &cli.model,
+                cli.precision.into(),
+                cli.device.into(),
+                prompt,
+                audio,
+                output,
+                system_prompt,
+                max_tokens,
+                text_temp,
+                audio_temp,
+                audio_top_k,
+            )
         }
         Commands::Info => {
             cmd_info(&cli.model, cli.precision.into(), cli.device.into())
@@ -216,12 +266,131 @@ fn cmd_tts(
 }
 
 fn cmd_chat(
-    _model_path: &PathBuf,
-    _precision: Precision,
-    _device: Device,
+    model_path: &PathBuf,
+    precision: Precision,
+    device: Device,
+    output: PathBuf,
+    system_prompt: Option<String>,
 ) -> Result<()> {
-    eprintln!("Interactive chat mode not yet implemented");
-    eprintln!("Use 'asr' or 'tts' subcommands instead");
+    eprintln!("Loading model from {}...", model_path.display());
+    let model = LFM2Audio::from_pretrained(model_path, precision, device)?;
+    let mut options = InterleavedOptions::default();
+    if let Some(prompt) = system_prompt {
+        options.system_prompt = prompt;
+    }
+    let mut session = model.chat_with_options(options);
+
+    eprintln!("Interactive chat ready.");
+    eprintln!("Commands:");
+    eprintln!("  <text>                 send a text turn");
+    eprintln!("  /audio <file> [text]   send an audio turn with optional text");
+    eprintln!("  reset                  clear conversation state");
+    eprintln!("  quit                   exit");
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut audio_turn = 0usize;
+
+    loop {
+        write!(stdout, "> ")?;
+        stdout.flush()?;
+
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break;
+        }
+
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        match line {
+            "quit" | "exit" => break,
+            "reset" => {
+                session.reset()?;
+                println!("Session reset.");
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(rest) = line.strip_prefix("/audio ") {
+            let mut parts = rest.splitn(2, ' ');
+            let audio_path = parts.next().unwrap_or_default();
+            let text_prompt = parts.next().map(str::trim).filter(|text| !text.is_empty());
+
+            let (audio, spec) = lfm2_audio::load_audio(audio_path)?;
+            session.add_user_audio_with_text(&audio, spec.sample_rate, text_prompt)?;
+        } else {
+            session.add_user_text(line);
+        }
+
+        let response = session.generate()?;
+        if !response.text.trim().is_empty() {
+            println!("{}", response.text);
+        }
+        if let Some(audio) = response.audio {
+            audio_turn += 1;
+            let turn_output = append_turn_suffix(&output, audio_turn);
+            lfm2_audio::save_audio(&turn_output, &audio, 24_000)?;
+            println!("Saved audio to {}", turn_output.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_interleaved(
+    model_path: &PathBuf,
+    precision: Precision,
+    device: Device,
+    prompt: Option<String>,
+    audio: Option<PathBuf>,
+    output: PathBuf,
+    system_prompt: Option<String>,
+    max_tokens: usize,
+    text_temp: f32,
+    audio_temp: f32,
+    audio_top_k: usize,
+) -> Result<()> {
+    eprintln!("Loading model from {}...", model_path.display());
+    let model = LFM2Audio::from_pretrained(model_path, precision, device)?;
+
+    let options = InterleavedOptions {
+        system_prompt: system_prompt
+            .unwrap_or_else(|| "Respond with interleaved text and audio.".to_string()),
+        max_new_tokens: max_tokens,
+        text_temperature: text_temp,
+        audio_temperature: audio_temp,
+        audio_top_k,
+        interleaved_n_text: None,
+        interleaved_n_audio: None,
+    };
+
+    let response = match (prompt, audio) {
+        (Some(prompt), None) => model.interleaved().respond_to_text_with_options(&prompt, &options)?,
+        (None, Some(audio_path)) => {
+            let (audio, spec) = lfm2_audio::load_audio(&audio_path)?;
+            model
+                .interleaved()
+                .respond_to_audio_with_options(&audio, spec.sample_rate, &options)?
+        }
+        _ => anyhow::bail!("Provide exactly one of --prompt or --audio"),
+    };
+
+    if !response.text.trim().is_empty() {
+        println!("{}", response.text);
+    }
+
+    lfm2_audio::save_audio(&output, &response.audio, 24_000)?;
+    eprintln!(
+        "Saved {} audio frames ({:.2}s) to {}",
+        response.audio_codes.len(),
+        response.audio.len() as f32 / 24_000.0,
+        output.display()
+    );
+
     Ok(())
 }
 
@@ -243,4 +412,14 @@ fn cmd_info(
     println!("  Device: {:?}", device);
 
     Ok(())
+}
+
+fn append_turn_suffix(path: &PathBuf, turn_idx: usize) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("chat_output");
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("wav");
+    let file_name = format!("{}-{}.{}", stem, turn_idx, ext);
+    path.with_file_name(file_name)
 }

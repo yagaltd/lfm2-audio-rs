@@ -1,7 +1,7 @@
 //! Mel spectrogram computation
 //! Extracted from parakeet-rs/src/audio.rs with modifications for LFM2.5
 
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use realfft::RealFftPlanner;
 use std::f32::consts::PI;
 
@@ -215,7 +215,7 @@ fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) -> Arr
 }
 
 /// Per-feature normalization (zero mean, unit variance)
-fn normalize_per_feature(mel: Array2<f32>) -> Array2<f32> {
+pub fn normalize_per_feature(mel: Array2<f32>) -> Array2<f32> {
     let num_frames = mel.shape()[0];
     let num_features = mel.shape()[1];
     
@@ -260,7 +260,11 @@ mod tests {
         // Window should be symmetric
         assert!((window[0] - window[399]).abs() < 1e-6);
         // Center should be 1.0
-        assert!((window[199] - 1.0).abs() < 1e-6);
+        // For even-length window, peak is between indices 199 and 200
+        // Both should be very close to 1.0 (~0.99997)
+        assert!(window[199] > 0.999);
+        assert!(window[200] > 0.999);
+        assert!(window[199] > window[0]);
     }
     
     #[test]

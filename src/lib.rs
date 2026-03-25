@@ -8,7 +8,7 @@
 //! # Quick Start
 //! 
 //! ```rust,no_run
-//! use lfm2_audio::{LFM2Audio, Precision, Device, ASROptions};
+//! use lfm2_audio::{LFM2Audio, Precision, Device, ASROptions, load_audio, save_audio};
 //! 
 //! fn main() -> anyhow::Result<()> {
 //!     // Load model
@@ -19,7 +19,7 @@
 //!     )?;
 //! 
 //!     // ASR
-//!     let audio = load_audio("input.wav")?;
+//!     let (audio, _spec) = load_audio("input.wav")?;
 //!     let text = model.asr().transcribe(&audio, 16000, &ASROptions::default())?;
 //!     println!("Transcription: {}", text);
 //! 
@@ -43,6 +43,7 @@ pub mod tts;
 pub mod interleaved;
 pub mod chat;
 pub mod audio;
+pub mod stream_decode;
 
 // Re-exports
 pub use error::{LFM2Error, Result};
@@ -52,9 +53,10 @@ pub use tokenizer::LFM2Tokenizer;
 pub use model::{LFM2Audio, ModelInfo};
 pub use asr::{ASRPipeline, ASROptions};
 pub use tts::{TTSPipeline, TTSOptions};
-pub use interleaved::{InterleavedPipeline, InterleavedResponse};
+pub use interleaved::{InterleavedEvent, InterleavedOptions, InterleavedPipeline, InterleavedResponse};
 pub use chat::{ChatSession, AssistantResponse, Turn};
-pub use audio::{load_audio, save_audio, compute_mel_spectrogram};
+pub use audio::{compute_mel_spectrogram, decode_wav_bytes, encode_wav_bytes, load_audio, save_audio};
+pub use stream_decode::{discover_default_mimi_checkpoint, discover_mimi_checkpoint_in_hf_root, MimiDecoderTemplate, MimiStreamingDecoder};
 
 // Audio utilities
 pub use audio::mel;

@@ -3,7 +3,6 @@
 //! Reference: hand-voice-racer/audio-model.js:800-1000
 
 use ndarray::Array2;
-use ort::value::TensorRef;
 
 use crate::audio::compute_mel_spectrogram;
 use crate::cache::GenerationCache;
@@ -146,6 +145,7 @@ impl<'a> ASRPipeline<'a> {
             logits = self.run_decoder(&next_embeds, &next_mask, &mut cache)?;
         }
 
+
         // 11. Decode tokens to text
         let text = self.model.tokenizer.decode(&generated_tokens, true);
         log::info!("ASR: Generated {} tokens -> {} chars", generated_tokens.len(), text.len());
@@ -157,20 +157,35 @@ impl<'a> ASRPipeline<'a> {
         &self,
         inputs_embeds: &ndarray::Array3<f32>,
         attention_mask: &Array2<i64>,
-        _cache: &mut GenerationCache,
+        cache: &mut GenerationCache,
     ) -> Result<ndarray::Array3<f32>> {
-        use ort::value::TensorRef;
+        use ort::value::Value;
         
-        // Prepare inputs using TensorRef
-        let t_inputs = TensorRef::from_array_view(inputs_embeds.view())?;
-        let t_mask = TensorRef::from_array_view(attention_mask.view())?;
+        // Ensure arrays are contiguous by cloning if necessary
+        let inputs_contig = inputs_embeds.as_standard_layout().to_owned();
+        let mask_contig = attention_mask.as_standard_layout().to_owned();
+        
+        // Create values from owned arrays
+        let t_inputs = Value::from_array(inputs_contig)?;
+        let t_mask = Value::from_array(mask_contig)?;
 
-        // Run decoder - use RefCell for interior mutability
+        // Get cache inputs (now returns DynValue directly)
+        let cache_inputs = cache.prepare_cache_inputs();
+        
+        // Build input list: start with required inputs
+        let mut inputs_list: Vec<(String, ort::value::DynValue)> = vec![
+            ("inputs_embeds".to_string(), t_inputs.into_dyn()),
+            ("attention_mask".to_string(), t_mask.into_dyn()),
+        ];
+        
+        // Add cache inputs (already DynValue)
+        for (name, value) in cache_inputs {
+            inputs_list.push((name, value));
+        }
+
+        // Run decoder with cache
         let mut decoder = self.model.sessions.decoder.borrow_mut();
-        let outputs = decoder.run(ort::inputs! {
-            "inputs_embeds" => t_inputs,
-            "attention_mask" => t_mask,
-        })?;
+        let outputs = decoder.run(inputs_list)?;
 
         // Extract logits
         let logits_output = outputs.get("logits")
@@ -192,8 +207,8 @@ impl<'a> ASRPipeline<'a> {
             flat,
         )?;
 
-        // TODO: Handle cache outputs properly
-        // Extract present_* tensors and update cache
+        // Update cache from decoder outputs (present_* -> past_*)
+        cache.update(&outputs)?;
         
         Ok(logits)
     }

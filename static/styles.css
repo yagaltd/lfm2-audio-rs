@@ -1,0 +1,258 @@
+:root {
+  --bg: #f4efe6;
+  --panel: rgba(255, 251, 245, 0.9);
+  --ink: #1d1a17;
+  --muted: #6b6359;
+  --line: rgba(29, 26, 23, 0.12);
+  --accent: #c4572e;
+  --accent-2: #00857a;
+  --shadow: 0 20px 50px rgba(50, 34, 18, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at top left, rgba(196, 87, 46, 0.16), transparent 25%),
+    radial-gradient(circle at top right, rgba(0, 133, 122, 0.14), transparent 18%),
+    linear-gradient(180deg, #faf5ed 0%, var(--bg) 60%, #efe7dc 100%);
+}
+
+.app {
+  width: min(1180px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 24px 0 40px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  box-shadow: var(--shadow);
+  padding: 20px;
+  backdrop-filter: blur(14px);
+}
+
+.hero {
+  margin-bottom: 20px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+  color: var(--accent);
+}
+
+h1, h2 {
+  margin: 0 0 12px;
+  font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
+}
+
+h1 {
+  font-size: clamp(30px, 5vw, 52px);
+  line-height: 1.02;
+  max-width: 14ch;
+}
+
+h2 {
+  font-size: 18px;
+}
+
+.lede {
+  margin: 10px 0 0;
+  max-width: 70ch;
+  color: var(--muted);
+}
+
+.grid {
+  display: grid;
+  gap: 20px;
+}
+
+.grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 20px;
+}
+
+.grid.compact {
+  gap: 12px;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.row.wrap {
+  flex-wrap: wrap;
+}
+
+label {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.label-with-value {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.label-with-value strong {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.toggle {
+  align-content: end;
+}
+
+.toggle input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  accent-color: var(--accent);
+}
+
+input,
+textarea,
+button {
+  font: inherit;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--ink);
+  border-radius: 14px;
+  padding: 12px 14px;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  padding: 11px 16px;
+  background: var(--ink);
+  color: white;
+  cursor: pointer;
+  transition: transform 140ms ease, opacity 140ms ease, background 140ms ease;
+}
+
+button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.status {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgba(196, 87, 46, 0.12);
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.status-pill.subtle {
+  background: rgba(0, 133, 122, 0.1);
+  color: var(--accent-2);
+}
+
+.meter {
+  height: 14px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(29, 26, 23, 0.08);
+}
+
+.meter-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), #efc05c);
+  transition: width 70ms linear;
+}
+
+.feed,
+.log {
+  min-height: 280px;
+  max-height: 420px;
+  overflow: auto;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--line);
+}
+
+.feed-item {
+  padding: 12px 14px;
+  border-radius: 14px;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+.feed-item.user {
+  background: rgba(0, 133, 122, 0.11);
+}
+
+.feed-item.assistant {
+  background: rgba(196, 87, 46, 0.11);
+}
+
+.feed-role {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.log {
+  white-space: pre-wrap;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+audio {
+  width: 100%;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 840px) {
+  .grid.two {
+    grid-template-columns: 1fr;
+  }
+
+  .row {
+    flex-wrap: wrap;
+  }
+
+  h1 {
+    max-width: none;
+  }
+}

@@ -4,7 +4,6 @@
 //! coordinating ONNX sessions, embeddings, tokenization, and caching.
 
 use ndarray::{Array2, Array3};
-use ort::value::TensorRef;
 use std::path::Path;
 
 use crate::cache::GenerationCache;
@@ -12,6 +11,7 @@ use crate::config::{Device, ModelConfig, Precision, PreprocessorConfig};
 use crate::embeddings::{AudioEmbedding, EmbedTokens};
 use crate::error::{LFM2Error, Result};
 use crate::sessions::{LFM2Sessions, SessionLoader};
+use crate::tokenizer::CODEBOOK_VOCAB;
 use crate::tokenizer::LFM2Tokenizer;
 
 /// Main LFM2Audio model
@@ -95,10 +95,15 @@ impl LFM2Audio {
             // Use ONNX session
             let input = ndarray::Array2::from_shape_vec(
                 (1, 8),
-                codes.iter().map(|&c| c as i64).collect(),
+                codes.iter()
+                    .enumerate()
+                    .map(|(idx, &c)| (idx * CODEBOOK_VOCAB + c as usize) as i64)
+                    .collect(),
             )?;
 
-            let t_input = TensorRef::from_array_view(input.view())?;
+            // Ensure contiguous layout
+            let input_contig = input.as_standard_layout().to_owned();
+            let t_input = ort::value::Value::from_array(input_contig)?;
             let mut session = session.borrow_mut();
             let outputs = session.run(ort::inputs! {
                 "audio_codes" => t_input,
@@ -111,7 +116,7 @@ impl LFM2Audio {
             let view = output.try_extract_array::<f32>()?;
             let shape = view.shape();
 
-            // Shape should be [1, 8, hidden_size] - average across codebook dim
+            // Shape should be [1, 8, hidden_size] - sum across codebook dim
             if shape.len() == 3 && shape[1] == 8 {
                 let hidden_size = shape[2];
                 let mut result = vec![0.0f32; hidden_size];
@@ -119,7 +124,6 @@ impl LFM2Audio {
                     for cb in 0..8 {
                         result[i] += view[[0, cb, i]];
                     }
-                    result[i] /= 8.0;
                 }
                 Ok(Array3::from_shape_vec((1, 1, hidden_size), result)?)
             } else {
@@ -147,7 +151,10 @@ impl LFM2Audio {
             let seq_len = all_embs.len();
             let hidden_size = all_embs[0].shape()[2];
             let flat: Vec<f32> = all_embs.into_iter()
-                .flat_map(|a| a.into_raw_vec())
+                .flat_map(|a| {
+                    let (raw, _offset) = a.into_raw_vec_and_offset();
+                    raw
+                })
                 .collect();
             Ok(Array3::from_shape_vec((1, seq_len, hidden_size), flat)?)
         }
@@ -163,8 +170,11 @@ impl LFM2Audio {
         // Mel lengths
         let mel_lengths = ndarray::Array1::from_vec(vec![num_frames as i64]);
 
-        let t_mel = TensorRef::from_array_view(mel_3d.view())?;
-        let t_lengths = TensorRef::from_array_view(mel_lengths.view())?;
+        // Ensure contiguous layout
+        let mel_contig = mel_3d.as_standard_layout().to_owned();
+        let lengths_contig = mel_lengths.as_standard_layout().to_owned();
+        let t_mel = ort::value::Value::from_array(mel_contig)?;
+        let t_lengths = ort::value::Value::from_array(lengths_contig)?;
 
         let mut encoder = self.sessions.audio_encoder.borrow_mut();
         let outputs = encoder.run(ort::inputs! {
@@ -195,23 +205,31 @@ impl LFM2Audio {
     }
 
     /// Access ASR pipeline
-    pub fn asr(&self) -> crate::asr::ASRPipeline {
+    pub fn asr(&self) -> crate::asr::ASRPipeline<'_> {
         crate::asr::ASRPipeline::new(self)
     }
 
     /// Access TTS pipeline
-    pub fn tts(&self) -> crate::tts::TTSPipeline {
+    pub fn tts(&self) -> crate::tts::TTSPipeline<'_> {
         crate::tts::TTSPipeline::new(self)
     }
 
     /// Access interleaved pipeline
-    pub fn interleaved(&self) -> crate::interleaved::InterleavedPipeline {
+    pub fn interleaved(&self) -> crate::interleaved::InterleavedPipeline<'_> {
         crate::interleaved::InterleavedPipeline::new(self)
     }
 
     /// Start a chat session
-    pub fn chat(&self) -> crate::chat::ChatSession {
+    pub fn chat(&self) -> crate::chat::ChatSession<'_> {
         crate::chat::ChatSession::new(self)
+    }
+
+    /// Start a chat session with custom interleaved options
+    pub fn chat_with_options(
+        &self,
+        options: crate::interleaved::InterleavedOptions,
+    ) -> crate::chat::ChatSession<'_> {
+        crate::chat::ChatSession::new_with_options(self, options)
     }
 
     /// Get model info

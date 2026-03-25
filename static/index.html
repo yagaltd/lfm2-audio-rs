@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LFM2 Audio Demo</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260324-nobuffer">
+</head>
+<body>
+  <main class="app">
+    <section class="panel hero">
+      <div>
+        <p class="eyebrow">LFM2 Audio</p>
+        <h1>Browser mic demo for ASR and interleaved audio replies</h1>
+        <p class="lede">Client-side VAD cuts utterances in the browser. The Rust server keeps the model resident and handles ASR, TTS, and interleaved chat over HTTP and WebSocket.</p>
+      </div>
+      <div class="grid two">
+        <label>
+          <span>System prompt</span>
+          <textarea id="systemPrompt" rows="3">Respond with interleaved text and audio.</textarea>
+        </label>
+        <label>
+          <span>Typed input</span>
+          <div class="row">
+            <input id="textInput" type="text" placeholder="Type a message for the assistant">
+            <button id="sendText">Send</button>
+          </div>
+        </label>
+      </div>
+    </section>
+
+    <section class="grid two">
+      <div class="panel">
+        <h2>Connection</h2>
+        <div class="row wrap">
+          <button id="connect">Connect</button>
+          <button id="disconnect" disabled>Disconnect</button>
+          <button id="resetSession" disabled>Reset Session</button>
+        </div>
+        <div class="status">
+          <div class="status-pill" id="connectionState">Disconnected</div>
+          <div class="status-pill subtle" id="phaseState">Idle</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Microphone</h2>
+        <div class="row wrap">
+          <button id="startMic" disabled>Start Mic</button>
+          <button id="stopMic" disabled>Stop Mic</button>
+        </div>
+        <div class="grid two compact">
+          <label>
+            <span class="label-with-value">
+              <span>VAD threshold</span>
+              <strong id="vadThresholdValue">0.50</strong>
+            </span>
+            <input id="vadThreshold" type="range" min="0.1" max="0.95" step="0.05" value="0.5">
+          </label>
+          <label>
+            <span>Silence timeout (ms)</span>
+            <input id="silenceTimeout" type="number" min="150" max="3000" step="50" value="700">
+          </label>
+        </div>
+        <div class="grid two compact">
+          <label>
+            <span>Min speech (ms)</span>
+            <input id="minSpeechMs" type="number" min="150" max="5000" step="50" value="350">
+          </label>
+          <label class="toggle">
+            <span>Show my transcript</span>
+            <input id="showTranscript" type="checkbox">
+          </label>
+        </div>
+        <div class="grid two compact">
+          <div>
+            <span>VAD meter</span>
+            <div class="meter">
+              <div class="meter-fill" id="vadMeter"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="grid two">
+      <div class="panel">
+        <h2>Transcript</h2>
+        <div class="feed" id="feed"></div>
+      </div>
+      <div class="panel">
+        <h2>Assistant audio</h2>
+        <audio id="assistantAudio" controls></audio>
+        <pre class="log" id="log"></pre>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="/static/app.js?v=20260324-nobuffer"></script>
+</body>
+</html>

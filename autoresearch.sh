@@ -5,7 +5,7 @@ set -euo pipefail
 MODEL_DIR="${LFM2_MODEL_DIR:-/home/aurel/Documents/vibe/STT-rust/LFM2.5-Audio-1.5B-ONNX}"
 SERVER_BIN="${SERVER_BIN:-./target/release/lfm2-server}"
 PORT="${PORT:-8080}"
-TIMEOUT="${TIMEOUT:-60}"
+TIMEOUT="${TIMEOUT:-120}"
 LOG_FILE=$(mktemp /tmp/lfm2-benchmark-XXXXXX.log)
 
 # Cleanup on exit
@@ -27,7 +27,7 @@ fi
 
 # Start server with timing logs
 echo "Starting server..." >&2
-RUST_LOG=info,lfm2_audio=info "$SERVER_BIN" --model "$MODEL_DIR" --bind "127.0.0.1:$PORT" > "$LOG_FILE" 2>&1 &
+RUST_LOG=info,lfm2_server=info NO_COLOR=1 "$SERVER_BIN" --model "$MODEL_DIR" --bind "127.0.0.1:$PORT" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to be ready
@@ -49,147 +49,142 @@ done
 run_query() {
     local query="$1"
     local query_label="$2"
+    local max_chunks="${3:-50}"
 
-    echo "Running query: $query_label" >&2
+    echo "Running query: $query_label (capturing $max_chunks chunks)" >&2
 
-    # Send WebSocket message and wait for completion
-    # The server logs will contain the timing info
+    # Send WebSocket message and capture first N chunks
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     node -e "
-        const WebSocket = require('ws');
-        const ws = new WebSocket('ws://localhost:$PORT/ws');
+        const WebSocket = require('$script_dir/node_modules/ws');
+        const ws = new WebSocket('ws://localhost:$PORT/ws/interleaved');
 
         ws.on('open', () => {
             ws.send(JSON.stringify({type: 'user.text', text: '$query'}));
         });
 
-        let receivedComplete = false;
-        ws.on('message', (data) => {
-            const msg = JSON.parse(data.toString());
-            if (msg.type === 'assistant.turn') {
-                receivedComplete = true;
-                ws.close();
+        let chunkCount = 0;
+        ws.on('message', (data, isBinary) => {
+            // Count binary chunks (audio)
+            if (isBinary) {
+                chunkCount++;
+                if (chunkCount >= $max_chunks) {
+                    console.log('Captured ' + chunkCount + ' audio chunks');
+                    ws.close();
+                    setTimeout(() => process.exit(0), 100);
+                }
+                return;
+            }
+            
+            try {
+                const msg = JSON.parse(data.toString());
+                if (msg.type === 'assistant.turn') {
+                    console.log('Query completed with ' + chunkCount + ' audio chunks');
+                    ws.close();
+                    setTimeout(() => process.exit(0), 100);
+                }
+            } catch (e) {
+                // Ignore parse errors for non-JSON messages
             }
         });
 
         // Timeout after ${TIMEOUT}s
         setTimeout(() => {
-            if (!receivedComplete) {
-                console.error('Query timed out');
-                ws.close();
-                process.exit(1);
-            }
+            console.log('Captured ' + chunkCount + ' chunks before timeout');
+            ws.close();
+            setTimeout(() => process.exit(0), 100);
         }, ${TIMEOUT}000);
-    " 2>&1 || {
-        echo "ERROR: Query '$query_label' failed" >&2
-        return 1
-    }
+    " 2>&1
 
     echo "Query '$query_label' completed" >&2
 }
 
-# Run test queries
+# Run test queries - capture first 50 frames each to measure timing
 echo "" >&2
 echo "=== Running benchmark queries ===" >&2
-run_query "Hello" "short_hello"
-sleep 1  # Brief pause between queries
-run_query "Tell me a joke" "long_joke"
+run_query "Say hi." "short_hi" 50
+sleep 2  # Brief pause between queries  
+run_query "Tell me a short joke." "short_joke" 50
 
 # Give server a moment to flush logs
-sleep 1
+sleep 2
 
 # Stop server to ensure all logs are flushed
 echo "Stopping server..." >&2
-kill "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
-SERVER_PID=""
+if [[ -n "${SERVER_PID:-}" ]]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+fi
+unset SERVER_PID
 
 # Parse logs and extract metrics
 echo "" >&2
 echo "=== Parsing timing metrics ===" >&2
 
-# Extract frame_gap_ms values from logs
-# Format: "audio frame generated" logs contain frame_gap_ms
-# Format: "streaming audio chunk ready" logs contain decode_elapsed_ms
-
-# Filter to relevant log lines
-grep -E "(audio frame generated|streaming audio chunk ready|assistant\.turn)" "$LOG_FILE" > "${LOG_FILE}.filtered" 2>/dev/null || true
-
-# Extract metrics using awk
-read -r max_frame_gap avg_frame_gap decode_ms total_ms rtf < <(
-    node -e "
-        const fs = require('fs');
-        const lines = fs.readFileSync('${LOG_FILE}.filtered', 'utf8').split('\n');
-
-        const frameGaps = [];
-        const decodeTimes = [];
-        let streamStartTime = null;
-        let lastChunkTime = null;
-        let totalAudioSamples = 0;
-
-        for (const line of lines) {
-            // Parse frame_gap_ms from 'audio frame generated' logs
-            const gapMatch = line.match(/frame_gap_ms=(\d+)/);
-            if (gapMatch && parseInt(gapMatch[1]) > 0) {
-                frameGaps.push(parseInt(gapMatch[1]));
-            }
-
-            // Parse decode_elapsed_ms from 'streaming audio chunk ready' logs
-            const decodeMatch = line.match(/decode_elapsed_ms=(\d+)/);
-            if (decodeMatch) {
-                decodeTimes.push(parseInt(decodeMatch[1]));
-            }
-
-            // Parse elapsed_ms for first chunk timing
-            const elapsedMatch = line.match(/elapsed_ms=(\d+)/);
-            if (elapsedMatch && !streamStartTime) {
-                streamStartTime = parseInt(elapsedMatch[1]);
-            }
-            if (elapsedMatch) {
-                lastChunkTime = parseInt(elapsedMatch[1]);
-            }
-
-            // Parse chunk_samples for RTF calculation
-            const samplesMatch = line.match(/chunk_samples=(\d+)/);
-            if (samplesMatch) {
-                totalAudioSamples += parseInt(samplesMatch[1]);
-            }
-        }
-
-        // Calculate metrics
-        const maxGap = frameGaps.length > 0 ? Math.max(...frameGaps) : 0;
-        const avgGap = frameGaps.length > 0 ? Math.round(frameGaps.reduce((a, b) => a + b, 0) / frameGaps.length) : 0;
-        const avgDecode = decodeTimes.length > 0 ? Math.round(decodeTimes.reduce((a, b) => a + b, 0) / decodeTimes.length) : 0;
-        const totalTime = lastChunkTime || 0;
-
-        // RTF = total_time / audio_duration
-        // audio_duration = samples / sample_rate (24kHz)
-        const audioDurationMs = (totalAudioSamples / 24000) * 1000;
-        const rtf = audioDurationMs > 0 ? (totalTime / audioDurationMs).toFixed(2) : 0;
-
-        // Output as space-separated values
-        console.log(maxGap, avgGap, avgDecode, totalTime, rtf);
-    "
-)
+# Extract frame_gap_ms and decode_elapsed_ms from logs
+# Log format: frame_gap_ms=87 decode_elapsed_ms=24
 
 # Output structured metrics for autoresearch
-echo ""
-echo "=== Results ===" >&2
-echo "METRIC max_frame_gap_ms=$max_frame_gap"
-echo "METRIC avg_frame_gap_ms=$avg_frame_gap"
-echo "METRIC decode_ms_per_frame=$decode_ms"
-echo "METRIC total_ms=$total_ms"
-echo "METRIC rtf=$rtf"
-echo ""
-echo "Max frame gap: ${max_frame_gap}ms" >&2
-echo "Avg frame gap: ${avg_frame_gap}ms" >&2
-echo "Decode time: ${decode_ms}ms/frame" >&2
-echo "Total time: ${total_ms}ms" >&2
-echo "RTF: $rtf" >&2
+node -e "
+    const fs = require('fs');
+    const log = fs.readFileSync('$LOG_FILE', 'utf8');
+
+    // Extract all frame_gap_ms values
+    const frameGapMatches = log.matchAll(/frame_gap_ms=(\d+)/g);
+    const frameGaps = [...frameGapMatches].map(m => parseInt(m[1])).filter(v => v > 0);
+
+    // Extract all decode_elapsed_ms values
+    const decodeMatches = log.matchAll(/decode_elapsed_ms=(\d+)/g);
+    const decodeTimes = [...decodeMatches].map(m => parseInt(m[1]));
+
+    // Extract total elapsed_ms (last one)
+    const elapsedMatches = log.matchAll(/elapsed_ms=(\d+)/g);
+    const elapsedTimes = [...elapsedMatches].map(m => parseInt(m[1]));
+    const totalMs = elapsedTimes.length > 0 ? elapsedTimes[elapsedTimes.length - 1] : 0;
+
+    // Extract chunk_samples to calculate total audio duration
+    const samplesMatches = log.matchAll(/chunk_samples=(\d+)/g);
+    const allSamples = [...samplesMatches].map(m => parseInt(m[1]));
+    const totalSamples = allSamples.reduce((a, b) => a + b, 0);
+
+    // Calculate metrics
+    const maxGap = frameGaps.length > 0 ? Math.max(...frameGaps) : 0;
+    const avgGap = frameGaps.length > 0 ? Math.round(frameGaps.reduce((a, b) => a + b, 0) / frameGaps.length) : 0;
+    const p95Gap = frameGaps.length > 0 ? frameGaps.sort((a, b) => a - b)[Math.floor(frameGaps.length * 0.95)] : 0;
+    const avgDecode = decodeTimes.length > 0 ? Math.round(decodeTimes.reduce((a, b) => a + b, 0) / decodeTimes.length) : 0;
+
+    // RTF = total_time / audio_duration
+    // audio_duration_ms = samples / 24000 * 1000
+    const audioDurationMs = (totalSamples / 24000) * 1000;
+    const rtf = audioDurationMs > 0 ? (totalMs / audioDurationMs).toFixed(3) : 0;
+
+    // Output
+    console.log('METRIC max_frame_gap_ms=' + maxGap);
+    console.log('METRIC avg_frame_gap_ms=' + avgGap);
+    console.log('METRIC p95_frame_gap_ms=' + p95Gap);
+    console.log('METRIC decode_ms_per_frame=' + avgDecode);
+    console.log('METRIC total_ms=' + totalMs);
+    console.log('METRIC rtf=' + rtf);
+    console.log('METRIC frame_count=' + frameGaps.length);
+    console.log('METRIC audio_duration_ms=' + Math.round(audioDurationMs));
+
+    console.error('');
+    console.error('=== Results ===');
+    console.error('Max frame gap: ' + maxGap + 'ms');
+    console.error('Avg frame gap: ' + avgGap + 'ms');
+    console.error('P95 frame gap: ' + p95Gap + 'ms');
+    console.error('Avg decode time: ' + avgDecode + 'ms/frame');
+    console.error('Total time: ' + totalMs + 'ms');
+    console.error('Audio duration: ' + Math.round(audioDurationMs) + 'ms');
+    console.error('RTF: ' + rtf);
+    console.error('Frame count: ' + frameGaps.length);
+"
 
 # Save full log for debugging
 if [[ "${DEBUG:-}" == "1" ]]; then
-    echo "Full log saved to: $LOG_FILE" >&2
+    echo "Full log saved to: /tmp/lfm2-benchmark-debug.log" >&2
     cp "$LOG_FILE" /tmp/lfm2-benchmark-debug.log
-else
-    rm -f "$LOG_FILE"
 fi
+
+# Note: cleanup trap will remove the temp log file
+

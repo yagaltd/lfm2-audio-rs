@@ -1,7 +1,6 @@
 //! Model configuration from config.json
 
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::Path;
 
 /// Model configuration loaded from config.json
@@ -258,6 +257,7 @@ pub enum Device {
 }
 
 impl Device {
+    #[allow(deprecated)]
     pub fn execution_providers(&self) -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
         use ort::execution_providers::*;
         

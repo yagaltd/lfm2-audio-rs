@@ -188,7 +188,6 @@ mod tests {
     fn test_asr_prompt_format() {
         // This test would need a real tokenizer
         // For now just verify the string format
-        let special = SpecialTokens::default();
         let prompt = format!(
             "<|startoftext|><|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n",
             "Perform ASR."

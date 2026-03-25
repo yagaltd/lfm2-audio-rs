@@ -38,7 +38,7 @@ fn test_load_model_q4() {
 fn test_load_model_fp16() {
     let model_path = get_model_path().expect("Model not found. Skipping test.");
     
-    let model = LFM2Audio::from_pretrained(&model_path, Precision::FP16, Device::CPU)
+    let _model = LFM2Audio::from_pretrained(&model_path, Precision::FP16, Device::CPU)
         .expect("Failed to load model");
     
     println!("✓ Model loaded successfully (FP16)");
