@@ -51,7 +51,7 @@ pub use embeddings::{EmbedTokens, AudioEmbedding};
 pub use tokenizer::LFM2Tokenizer;
 pub use model::{LFM2Audio, ModelInfo};
 pub use asr::{ASRPipeline, ASROptions};
-pub use tts::{TTSPipeline, TTSOptions};
+pub use tts::{TTSPipeline, TTSOptions, decode_audio_codes_standalone};
 pub use interleaved::{InterleavedEvent, InterleavedOptions, InterleavedPipeline, InterleavedResponse};
 pub use chat::{ChatSession, AssistantResponse, Turn};
 pub use audio::{compute_mel_spectrogram, decode_wav_bytes, encode_wav_bytes, load_audio, save_audio};

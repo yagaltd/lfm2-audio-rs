@@ -795,3 +795,79 @@ fn top_candidates(logits: &[f32], n: usize) -> Vec<TTSLogitCandidate> {
         })
         .collect()
 }
+
+/// Standalone audio decode function for async/background thread use.
+/// Takes the detokenizer session directly, avoiding the need for full LFM2Audio.
+/// This enables thread-safe decode operations.
+pub fn decode_audio_codes_standalone(
+    detokenizer: &mut ort::session::Session,
+    codes: &[[u16; 8]],
+) -> Result<Vec<f32>> {
+    use crate::audio::istft::ISTFT;
+    
+    if codes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Convert codes to tensor
+    let num_frames = codes.len();
+    let mut codes_array = ndarray::Array3::<i64>::zeros((1, 8, num_frames));
+    for (t, frame) in codes.iter().enumerate() {
+        for (cb, &code) in frame.iter().enumerate() {
+            codes_array[[0, cb, t]] = code.min(2047) as i64;
+        }
+    }
+
+    let codes_contig = codes_array.as_standard_layout().to_owned();
+    let t_codes = ort::value::Value::from_array(codes_contig)?;
+
+    // Run audio detokenizer
+    let outputs = detokenizer.run(ort::inputs! {
+        "audio_codes" => t_codes,
+    }).map_err(|e| LFM2Error::Onnx(e.into()))?;
+
+    // Extract features
+    let features_output = outputs.get("stft_features")
+        .or_else(|| outputs.get("output"))
+        .or_else(|| outputs.get("waveform"))
+        .or_else(|| outputs.get("stft"))
+        .ok_or_else(|| LFM2Error::Generation(
+            "detokenizer output not found".to_string()
+        ))?;
+
+    let view = features_output.try_extract_array::<f32>()
+        .map_err(|e| LFM2Error::Onnx(e.into()))?;
+    let shape = view.shape();
+    
+    let (out_frames, feature_dim) = if shape.len() == 3 {
+        (shape[1], shape[2])
+    } else {
+        (shape[0], shape[1])
+    };
+
+    let n_freqs = 641; // feature_dim / 2
+    let flat: Vec<f32> = view.iter().copied().collect();
+    
+    // Extract spectrogram
+    let mut log_abs_data = Vec::with_capacity(out_frames * n_freqs);
+    let mut angle_data = Vec::with_capacity(out_frames * n_freqs);
+
+    for frame in 0..out_frames {
+        let frame_offset = frame * feature_dim;
+        for i in 0..n_freqs {
+            log_abs_data.push(flat[frame_offset + i]);
+        }
+        for i in 0..n_freqs {
+            angle_data.push(flat[frame_offset + n_freqs + i]);
+        }
+    }
+
+    let log_abs = ndarray::Array2::from_shape_vec((out_frames, n_freqs), log_abs_data)?
+        .reversed_axes();
+    let angle = ndarray::Array2::from_shape_vec((out_frames, n_freqs), angle_data)?
+        .reversed_axes();
+
+    // ISTFT
+    let istft = ISTFT::new(1280, 320, 1280);
+    istft.inverse_from_log_polar(&log_abs, &angle)
+}

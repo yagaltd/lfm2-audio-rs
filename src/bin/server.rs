@@ -470,6 +470,60 @@ const HOP_LENGTH: usize = 320;
 const WIN_LENGTH: usize = 1280;
 const N_FFT: usize = 1280;
 
+/// Request to decode audio codes in background thread
+struct AsyncDecodeRequest {
+    codes: Vec<[u16; 8]>,
+    request_id: u64,
+}
+
+/// Result from background decode
+struct AsyncDecodeResult {
+    request_id: u64,
+    waveform: Result<Vec<f32>, String>,
+}
+
+/// Background decode thread handle
+struct AsyncDecodeThread {
+    /// Channel to send decode requests
+    request_tx: std::sync::mpsc::Sender<AsyncDecodeRequest>,
+    /// Channel to receive decode results
+    result_rx: std::sync::mpsc::Receiver<AsyncDecodeResult>,
+}
+
+impl AsyncDecodeThread {
+    fn spawn(detokenizer: Arc<Mutex<ort::session::Session>>) -> Self {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        
+        std::thread::Builder::new()
+            .name("async-decode".to_string())
+            .spawn(move || {
+                while let Ok(req) = request_rx.recv() {
+                    let mut session = detokenizer.lock().unwrap();
+                    let waveform = lfm2_audio::decode_audio_codes_standalone(&mut session, &req.codes)
+                        .map_err(|e| e.to_string());
+                    if result_tx.send(AsyncDecodeResult { request_id: req.request_id, waveform }).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn async decode thread");
+        
+        Self { request_tx, result_rx }
+    }
+    
+    fn request_decode(&self, codes: Vec<[u16; 8]>, request_id: u64) -> ApiResult<()> {
+        self.request_tx
+            .send(AsyncDecodeRequest { codes, request_id })
+            .map_err(|_| ApiError::internal("decode thread disconnected"))?;
+        Ok(())
+    }
+    
+    fn try_recv(&self) -> Option<AsyncDecodeResult> {
+        self.result_rx.try_recv().ok()
+    }
+}
+
 struct OnnxStreamingAudioDecoder<'a> {
     tts: lfm2_audio::TTSPipeline<'a>,
     all_codes: Vec<[u16; 8]>,
