@@ -468,6 +468,8 @@ enum ModelCommand {
     SessionText {
         session_id: u64,
         text: String,
+        /// If true, generate text only (for external TTS like KittenTTS)
+        text_only: bool,
         stream: mpsc::Sender<AssistantStreamEvent>,
         reply: oneshot::Sender<ApiResult<AssistantTurn>>,
     },
@@ -1126,12 +1128,14 @@ fn model_worker(
             ModelCommand::SessionText {
                 session_id,
                 text,
+                text_only,
                 stream,
                 reply,
             } => {
                 info!(
                     session_id,
                     text_len = text.len(),
+                    text_only,
                     "streaming text turn started"
                 );
                 let session = sessions.entry(session_id).or_insert_with(|| {
@@ -1140,6 +1144,7 @@ fn model_worker(
                         interleaved_overrides,
                     ))
                 });
+                session.set_text_only(text_only);
                 session.add_user_text(&text);
                 // Use async decoder for background ONNX inference
                 let mut audio_decoder = AsyncStreamingDecoder::new(
@@ -1693,19 +1698,84 @@ async fn handle_client_message(
             let worker_index = session_worker_index(state, session_id).await;
             let (reply_tx, reply_rx) = oneshot::channel();
             let (stream_tx, mut stream_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+            
+            // Use text-only mode for hybrid pipeline (LFM2 text → KittenTTS audio)
+            let text_only = session_settings.tts_backend == "kitten";
+            
             state.workers[worker_index]
                 .send(ModelCommand::SessionText {
                     session_id,
                     text,
+                    text_only,
                     stream: stream_tx,
                     reply: reply_tx,
                 })
                 .await
                 .map_err(|_| ApiError::internal("model worker unavailable"))?;
             let _ = send_streaming_assistant_events(socket, &mut stream_rx).await?;
-            let response = reply_rx
+            let mut response = reply_rx
                 .await
                 .map_err(|_| ApiError::internal("text reply dropped"))??;
+
+            // Hybrid mode: synthesize text with KittenTTS instead of LFM2 audio codes
+            #[cfg(feature = "kitten-tts")]
+            if session_settings.tts_backend == "kitten" {
+                if let Some(ref kitten_tts) = state.kitten_tts {
+                    if !response.text.trim().is_empty() {
+                        info!(session_id, text_len = response.text.len(), "Synthesizing with KittenTTS");
+                        
+                        let mut model = kitten_tts.lock().await;
+                        let synthesis_start = Instant::now();
+                        
+                        match model.generate(&response.text, "Bella", 1.0, true) {
+                            Ok(audio) => {
+                                let synthesis_ms = synthesis_start.elapsed().as_millis();
+                                info!(
+                                    session_id,
+                                    samples = audio.len(),
+                                    duration_ms = (audio.len() as f64 / 24000.0 * 1000.0) as u64,
+                                    synthesis_ms,
+                                    "KittenTTS synthesis complete"
+                                );
+                                
+                                // Send audio start message
+                                send_ws_json(
+                                    socket,
+                                    &ServerWsMessage::AssistantAudioStart {
+                                        sample_rate: 24000,
+                                        format: "pcm_f32le",
+                                        channels: 1,
+                                        chunk_samples: audio.len(),
+                                    },
+                                )
+                                .await?;
+                                
+                                // Send audio chunk
+                                let audio_bytes: Vec<u8> = audio
+                                    .iter()
+                                    .flat_map(|&s| s.to_le_bytes())
+                                    .collect();
+                                socket
+                                    .send(Message::Binary(audio_bytes.into()))
+                                    .await
+                                    .map_err(|err| ApiError::internal(err.to_string()))?;
+                                
+                                // Send audio end
+                                send_ws_json(socket, &ServerWsMessage::AssistantAudioEnd).await?;
+                            }
+                            Err(e) => {
+                                warn!(session_id, error = %e, "KittenTTS synthesis failed");
+                            }
+                        }
+                    }
+                } else {
+                    warn!(
+                        session_id,
+                        "KittenTTS backend requested but model not loaded. Use --kitten-tts-path."
+                    );
+                }
+            }
+
             send_assistant_turn(socket, &response).await?;
             send_ws_json(socket, &ServerWsMessage::Status { phase: "listening" }).await?;
             Ok(())
