@@ -6,6 +6,7 @@ MODEL_DIR="${LFM2_MODEL_DIR:-/home/aurel/Documents/vibe/STT-rust/LFM2.5-Audio-1.
 SERVER_BIN="${SERVER_BIN:-./target/release/lfm2-server}"
 PORT="${PORT:-8080}"
 TIMEOUT="${TIMEOUT:-120}"
+PRECISION="${LFM2_PRECISION:-q4}"
 LOG_FILE=$(mktemp /tmp/lfm2-benchmark-XXXXXX.log)
 
 # Cleanup on exit
@@ -27,7 +28,7 @@ fi
 
 # Start server with timing logs
 echo "Starting server..." >&2
-RUST_LOG=info,lfm2_server=info NO_COLOR=1 "$SERVER_BIN" --model "$MODEL_DIR" --bind "127.0.0.1:$PORT" > "$LOG_FILE" 2>&1 &
+RUST_LOG=info,lfm2_server=info NO_COLOR=1 "$SERVER_BIN" --model "$MODEL_DIR" --bind "127.0.0.1:$PORT" --precision "$PRECISION" > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 
 # Wait for server to be ready

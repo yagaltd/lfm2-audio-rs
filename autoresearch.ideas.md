@@ -12,67 +12,68 @@ Best achieved: **max_frame_gap 324-346ms, RTF ~1.0**
 | context_frames=0 | Eliminate window growth |
 | intra_threads=8 | Better parallel ONNX execution |
 
-## Future Ideas
+## Tried & Discarded
 
-### High Impact (Requires Architectural Changes)
+| Experiment | Result | Reason |
+|------------|--------|--------|
+| batch_frames=2 | 422ms, RTF 1.16 | Worse than batch=1 |
+| intra_threads=16 | 343ms, RTF 1.12 | Thread contention |
+| inter_threads=2 | No improvement | Not helpful |
+| Q8 precision | 428ms, RTF 1.10 | Larger model, worse performance |
+| FP16 precision | Timeout | Much larger model, very slow |
+
+## Optimization Limit Reached
+
+Within the constraints (no new dependencies, maintain API compatibility, CPU-only), the best achievable is:
+- **Max frame gap: 324-346ms** (78% improvement from 1500ms baseline)
+- **RTF: 0.97-1.02** (at or near real-time)
+
+The target of <30ms max gap cannot be achieved without:
+1. **Async decode pipeline** (architectural change)
+2. **GPU acceleration** (hardware requirement)
+
+## Future Ideas (Require Constraints Change)
+
+### High Impact (Architectural Changes)
 
 1. **Async Decode Pipeline**
-   - Run ONNX inference in separate thread
+   - Run ONNX inference in blocking thread pool
    - Decode next batch while sending current audio
-   - Would require tokio channel integration
+   - Would require tokio::task::spawn_blocking
    - Expected improvement: 50-70% reduction in max gap
-   - Effort: High (weeks)
+   - Effort: High (significant refactoring)
+   - **No new dependencies required** - tokio already used
 
 2. **GPU Acceleration**
    - Use CUDA/CoreML/DirectML execution providers
    - ONNX Runtime supports GPU inference
    - Would require CUDA-enabled hardware
    - Expected improvement: 5-10x faster decode
-   - Effort: Medium (days)
+   - Effort: Medium (add feature flag, hardware dependency)
 
-3. **Pre-buffering During Text Generation**
-   - Start decoding first audio frames during text-only phase
-   - Fill client buffer before audio streaming starts
-   - Would help initial latency, not steady-state gaps
-   - Effort: Medium
+### Medium Impact (Requires Dependencies)
 
-### Medium Impact
-
-4. **ONNX Session Pooling**
-   - Pre-warm multiple ONNX sessions
-   - Could allow parallel frame decoding
-   - Limited by thread safety of sessions
-
-5. **Thread-affinity for ONNX Threads**
+3. **Thread-affinity for ONNX Threads**
    - Pin ONNX intra threads to specific cores
    - Reduce context switch overhead
-   - Linux-specific optimization
+   - Would require `core_affinity` crate
+   - **Blocked by: No new dependencies constraint**
 
-6. **Memory Pre-allocation**
-   - Pre-allocate output buffers in hot path
-   - Reduce allocation overhead in decode loop
+### Low Impact (Already Optimized)
 
-### Low Impact / Exploration
+4. **ONNX Graph Optimization**
+   - Already using GraphOptimizationLevel::Level3
+   - No further improvement possible
 
-7. **Try Q8 Precision**
-   - Q8 model might have slightly better accuracy/performance tradeoff
-   - File: audio_detokenizer_q8.onnx (76MB vs 56MB for Q4)
-
-8. **ONNX Graph Optimization**
-   - Explore ONNX Runtime graph optimization flags
-   - Could reduce inference overhead
-
-9. **Client-side Frame Interpolation**
-   - Smooth over gaps in audio playback
-   - Would require client modifications
-   - Not a server-side fix
+5. **Memory Pre-allocation**
+   - Minimal impact compared to ONNX inference time
 
 ## Constraints
 
 - No new dependencies allowed
 - Must maintain API compatibility
 - Tests must pass
-- Must work with existing ONNX models
+- Must work with existing ONNX models (Q4 quantization is optimal)
 
 ## Hardware Requirements for <30ms Target
 
@@ -83,11 +84,11 @@ Options:
 1. **CUDA GPU** - Would likely achieve <10ms decode
 2. **Apple Silicon (CoreML)** - Could achieve ~20-30ms decode
 3. **Async pipeline** - Would hide decode latency behind transmission
-4. **Smaller model** - Would need model retraining/export
 
-## Next Steps
+## Recommendation
 
-1. Profile ONNX inference to identify bottlenecks
-2. Add CUDA support to Cargo.toml (feature flag)
-3. Implement async decode pipeline for streaming
-4. Consider WebSocket ping/pong for latency measurement
+The most practical path forward is implementing an **async decode pipeline**:
+- No new dependencies (uses existing tokio)
+- Could reduce max gap by 50-70%
+- Would allow audio streaming while next batch decodes
+- Implementation: Use `tokio::task::spawn_blocking` for ONNX inference
