@@ -63,7 +63,8 @@ All source files may be modified:
 - After Moshi removal + context tracking: ~1500ms (same, but eliminated redundant context decode)
 - After batch_frames=1: ~1200ms
 - After context_frames=0: ~519ms
-- **Current (batch_frames=1, context_frames=0)**: `max_frame_gap_ms` **305ms**
+- After intra_threads=8: ~324ms
+- **Current (batch_frames=1, context_frames=0, intra_threads=8)**: `max_frame_gap_ms` **324ms**, RTF **0.969**
 
 ## What's Been Tried
 
@@ -72,24 +73,28 @@ All source files may be modified:
 2. **Track last_emitted_samples** - Avoid re-decoding context frames to find slice position
 3. **Set batch_frames=1** - Decode each frame immediately, reducing batch latency
 4. **Set context_frames=0** - Eliminate window growth, decode only pending frames
-5. **Fixed tests** - Removed Mimi-specific tests after dependency removal
+5. **Set intra_threads=8** - More parallel ONNX execution for faster decode
+6. **Fixed tests** - Removed Mimi-specific tests after dependency removal
 
 ### Results Summary
 | Config | Max Gap | RTF | Notes |
 |--------|----------|-----|-------|
-| Baseline (batch=4, ctx=16) | ~1500ms | ? | Window grows to 17 frames |
+| Baseline (batch=4, ctx=16, threads=4) | ~1500ms | ? | Window grows to 17 frames |
 | batch=1 | ~1200ms | ? | Marginally better |
 | ctx=0 | ~519ms | ? | Major improvement |
-| **batch=1, ctx=0** | **305ms** | **0.986** | **80% improvement** |
+| batch=1, ctx=0 | ~305-349ms | ~1.0 | 80% improvement |
+| batch=1, ctx=0, threads=8 | **324ms** | **0.969** | **Best result** |
+| batch=1, ctx=0, threads=16 | 343ms | 1.124 | Worse - thread contention |
+| batch=2, ctx=0, threads=4 | 422ms | 1.159 | Worse - longer decode batches |
 
 ### Remaining Bottleneck
-- Decode latency ~69ms per frame, but frames arrive every ~50ms
-- Max gap 305ms still above 30ms target
-- Need parallel decode/generate pipeline or smaller frame sizes
+- Decode latency ~72ms per frame
+- Max gap 324ms still above 30ms target
+- Need async pipeline or GPU acceleration for <30ms gaps
 
 ### Potential Future Optimizations
-1. **Parallel decode** - decode next batch while sending current (requires async pipeline)
-2. **Pre-buffering** - start audio decode during text generation phase
-3. **ONNX thread optimization** - tune intra_op_num_threads for parallel execution
+1. **Async decode pipeline** - decode next batch while sending current audio (would require architectural changes)
+2. **GPU acceleration** - Use CUDA/Metal for ONNX execution
+3. **Pre-buffering** - start audio decode during text generation phase
 4. **Frame interpolation** - smooth over small gaps client-side
-5. **Smaller frame sizes** - if model supports finer granularity
+5. **Smaller model** - if a faster audio detokenizer is available
