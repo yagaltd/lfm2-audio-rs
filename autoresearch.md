@@ -64,9 +64,10 @@ All source files may be modified:
 - After batch_frames=1: ~1200ms
 - After context_frames=0: ~519ms
 - After intra_threads=8: ~324ms
-- **Final (batch_frames=1, context_frames=0, intra_threads=8)**: `max_frame_gap_ms` **342ms**, RTF **0.961**
+- **Final (batch_frames=1, context_frames=0, intra_threads=8)**: `max_frame_gap_ms` **346ms**, RTF **0.96**
+- **With Arc<Mutex> detokenizer**: `max_frame_gap_ms` **346ms**, RTF **0.96** (unchanged, prerequisite for async)
 
-**Optimization Limit Reached**: Target of <30ms not achievable within constraints.
+**Optimization Limit Reached**: Target of <30ms not achievable without async decode or GPU.
 
 ## What's Been Tried
 
