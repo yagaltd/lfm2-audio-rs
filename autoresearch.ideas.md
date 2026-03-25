@@ -60,18 +60,20 @@ The target of <30ms max gap cannot be achieved without GPU acceleration.
 
 ### High Impact
 1. **GPU acceleration** - Use CUDA/Metal for ONNX execution
-   - Expected: <10ms per frame decode
+   - Expected: <10ms per frame decode (vs 90ms CPU)
    - Would achieve <30ms max gap target
-   - Requires: GPU hardware, ORT GPU EP
+   - Requires: GPU hardware, ORT CUDA/CoreML EP
+   - Implementation: Add CUDA feature flag, test with RTX/GTX cards
 
 ### Medium Impact
 2. **Multiple decode threads** - Parallel decode with separate ONNX sessions
    - Would reduce queue buildup during burst generation
-   - Complex: Each session loads model into memory
+   - Memory overhead: ~54MB per additional Q4 session
+   - Implementation: Create thread pool with N detokenizer sessions, round-robin requests
 
 3. **Pre-buffering during text phase** - Start decode before audio frames arrive
    - Would reduce first-frame latency
-   - Requires: Predicting when audio will start
+   - Requires: Predicting when audio will start (complex)
 
 ### Low Impact
 4. **Frame interpolation** - Smooth over small gaps client-side
@@ -81,6 +83,19 @@ The target of <30ms max gap cannot be achieved without GPU acceleration.
 5. **Smaller/faster model** - If available
    - Would reduce per-frame decode time
    - May impact quality
+
+## Analyzed & Rejected Ideas
+
+| Idea | Verdict | Reason |
+|------|---------|--------|
+| **16kHz sample rate** | ❌ Not viable | Requires model retraining - sample rate baked into ONNX weights |
+| **Pocket TTS / KittenTTS** | ⚠️ Separate use case | Incompatible with LFM2 audio codes. Could be separate TTS endpoint |
+| **TurboQuant** | ❌ Not applicable | Optimizes quantization quality, not inference speed. Doesn't help ONNX decode |
+| **INT8 quantization** | ❌ Tried | Q8 (73MB) slower than Q4 (54MB) - 428ms vs 324ms max gap |
+| **FP16 precision** | ❌ Tried | Timeout - 172MB model much slower than Q4 |
+| **intra_threads=16** | ❌ Tried | Thread contention - 343ms vs 324ms with 8 threads |
+| **inter_threads=2** | ❌ Tried | No improvement |
+| **batch_frames=2** | ❌ Tried | Worse - 422ms vs 305ms with batch=1 |
 
 ## Why <30ms is Not Achievable (CPU-only)
 
