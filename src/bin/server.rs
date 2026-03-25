@@ -476,6 +476,8 @@ enum ModelCommand {
         audio: Vec<f32>,
         sample_rate: u32,
         text_prompt: Option<String>,
+        /// If true, generate text only (for external TTS like KittenTTS)
+        text_only: bool,
         stream: mpsc::Sender<AssistantStreamEvent>,
         reply: oneshot::Sender<ApiResult<AssistantTurn>>,
     },
@@ -825,6 +827,9 @@ enum ClientWsMessage {
     SessionStart {
         #[serde(default)]
         system_prompt: Option<String>,
+        /// TTS backend: "lfm2" (default) or "kitten" (hybrid mode with faster TTS)
+        #[serde(default)]
+        tts_backend: Option<String>,
     },
     #[serde(rename = "user.text")]
     UserText { text: String },
@@ -892,6 +897,13 @@ enum ServerWsMessage<'a> {
 struct PendingAudioTurn {
     sample_rate: u32,
     bytes: Vec<u8>,
+}
+
+/// Session-level settings that persist across turns
+#[derive(Debug, Clone, Default)]
+struct SessionSettings {
+    /// TTS backend: "lfm2" (default) or "kitten" (hybrid mode)
+    tts_backend: String,
 }
 
 #[tokio::main]
@@ -1268,6 +1280,7 @@ fn model_worker(
                 audio,
                 sample_rate,
                 text_prompt,
+                text_only,
                 stream,
                 reply,
             } => {
@@ -1278,6 +1291,7 @@ fn model_worker(
                     input_duration_ms = ((audio.len() as f64 / sample_rate as f64) * 1000.0)
                         .round() as u64,
                     has_text_prompt = text_prompt.is_some(),
+                    text_only,
                     "streaming audio turn started"
                 );
                 let session = sessions.entry(session_id).or_insert_with(|| {
@@ -1286,6 +1300,8 @@ fn model_worker(
                         interleaved_overrides,
                     ))
                 });
+                // Set text-only mode for external TTS (KittenTTS)
+                session.set_text_only(text_only);
                 let add_result =
                     session.add_user_audio_with_text(&audio, sample_rate, text_prompt.as_deref());
                 // Use async decoder for background ONNX inference
@@ -1560,6 +1576,7 @@ async fn interleaved_socket(
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let session_id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
     let mut pending_audio: Option<PendingAudioTurn> = None;
+    let mut session_settings: SessionSettings = SessionSettings::default();
 
     if let Err(err) =
         send_ws_json(&mut socket, &ServerWsMessage::Status { phase: "listening" }).await
@@ -1591,6 +1608,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         &state,
                         session_id,
                         &mut pending_audio,
+                        &mut session_settings,
                         payload,
                     )
                     .await
@@ -1632,10 +1650,16 @@ async fn handle_client_message(
     state: &AppState,
     session_id: u64,
     pending_audio: &mut Option<PendingAudioTurn>,
+    session_settings: &mut SessionSettings,
     payload: ClientWsMessage,
 ) -> ApiResult<()> {
     match payload {
-        ClientWsMessage::SessionStart { system_prompt } => {
+        ClientWsMessage::SessionStart { system_prompt, tts_backend } => {
+            // Store the TTS backend preference for this session
+            if let Some(backend) = tts_backend {
+                session_settings.tts_backend = backend;
+            }
+            
             let prompt =
                 system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT_INTERLEAVED.to_string());
             let worker_index = session_worker_index(state, session_id).await;
@@ -1732,12 +1756,17 @@ async fn handle_client_message(
             let chat_text_prompt = text_prompt.clone();
             let (chat_tx, chat_rx) = oneshot::channel();
             let (stream_tx, mut stream_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+            
+            // Use text-only mode for hybrid pipeline (LFM2 text → KittenTTS audio)
+            let text_only = session_settings.tts_backend == "kitten";
+            
             state.workers[worker_index]
                 .send(ModelCommand::SessionAudio {
                     session_id,
                     audio: chat_audio,
                     sample_rate: pending.sample_rate,
                     text_prompt: chat_text_prompt,
+                    text_only,
                     stream: stream_tx,
                     reply: chat_tx,
                 })
@@ -1782,6 +1811,65 @@ async fn handle_client_message(
                     Err(_) => {
                         warn!("transcript worker dropped reply for session {}", session_id);
                     }
+                }
+            }
+
+            // Hybrid mode: synthesize text with KittenTTS instead of LFM2 audio codes
+            #[cfg(feature = "kitten-tts")]
+            if session_settings.tts_backend == "kitten" {
+                if let Some(ref kitten_tts) = state.kitten_tts {
+                    if !response.text.trim().is_empty() {
+                        info!(session_id, text_len = response.text.len(), "Synthesizing with KittenTTS");
+                        
+                        let mut model = kitten_tts.lock().await;
+                        let synthesis_start = Instant::now();
+                        
+                        match model.generate(&response.text, "Bella", 1.0, true) {
+                            Ok(audio) => {
+                                let synthesis_ms = synthesis_start.elapsed().as_millis();
+                                info!(
+                                    session_id,
+                                    samples = audio.len(),
+                                    duration_ms = (audio.len() as f64 / 24000.0 * 1000.0) as u64,
+                                    synthesis_ms,
+                                    "KittenTTS synthesis complete"
+                                );
+                                
+                                // Send audio start message
+                                send_ws_json(
+                                    socket,
+                                    &ServerWsMessage::AssistantAudioStart {
+                                        sample_rate: 24000,
+                                        format: "pcm_f32le",
+                                        channels: 1,
+                                        chunk_samples: audio.len(),
+                                    },
+                                )
+                                .await?;
+                                
+                                // Send audio chunk
+                                let audio_bytes: Vec<u8> = audio
+                                    .iter()
+                                    .flat_map(|&s| s.to_le_bytes())
+                                    .collect();
+                                socket
+                                    .send(Message::Binary(audio_bytes.into()))
+                                    .await
+                                    .map_err(|err| ApiError::internal(err.to_string()))?;
+                                
+                                // Send audio end
+                                send_ws_json(socket, &ServerWsMessage::AssistantAudioEnd).await?;
+                            }
+                            Err(e) => {
+                                warn!(session_id, error = %e, "KittenTTS synthesis failed");
+                            }
+                        }
+                    }
+                } else {
+                    warn!(
+                        session_id,
+                        "KittenTTS backend requested but model not loaded. Use --kitten-tts-path."
+                    );
                 }
             }
 

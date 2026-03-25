@@ -119,6 +119,7 @@ fn test_chat_with_custom_system_prompt_generates_real_output() {
         audio_top_k: 1,
         interleaved_n_text: None,
         interleaved_n_audio: None,
+        text_only: false,
     });
 
     session.add_user_text("Greet the crew briefly.");

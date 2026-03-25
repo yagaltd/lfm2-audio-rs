@@ -23,6 +23,7 @@ const vadThresholdValue = document.getElementById("vadThresholdValue");
 const silenceTimeoutInput = document.getElementById("silenceTimeout");
 const minSpeechMsInput = document.getElementById("minSpeechMs");
 const showTranscriptInput = document.getElementById("showTranscript");
+const fastTtsModeInput = document.getElementById("fastTtsMode");
 const connectionState = document.getElementById("connectionState");
 const phaseState = document.getElementById("phaseState");
 const vadMeter = document.getElementById("vadMeter");
@@ -326,10 +327,12 @@ function connectSocket() {
     setConnectionLabel("Connected");
     setPhase("Listening");
     updateControls();
-    log("WebSocket connected");
+    const ttsBackend = fastTtsModeInput.checked ? "kitten" : "lfm2";
+    log(`WebSocket connected (TTS: ${ttsBackend})`);
     ws.send(JSON.stringify({
       type: "session.start",
       system_prompt: systemPromptInput.value.trim(),
+      tts_backend: ttsBackend,
     }));
   });
 

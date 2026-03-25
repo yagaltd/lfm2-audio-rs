@@ -41,6 +41,13 @@
           <div class="status-pill" id="connectionState">Disconnected</div>
           <div class="status-pill subtle" id="phaseState">Idle</div>
         </div>
+        <label class="toggle compact">
+          <span class="label-with-value">
+            <span>Fast TTS mode (KittenTTS)</span>
+            <input id="fastTtsMode" type="checkbox">
+          </span>
+          <span class="hint">~50ms/frame vs LFM2's ~90ms/frame. Text-only LLM + KittenTTS synthesis.</span>
+        </label>
       </div>
 
       <div class="panel">

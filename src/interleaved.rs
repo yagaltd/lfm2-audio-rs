@@ -44,6 +44,8 @@ pub struct InterleavedOptions {
     pub audio_top_k: usize,
     pub interleaved_n_text: Option<usize>,
     pub interleaved_n_audio: Option<usize>,
+    /// If true, stop at <|audio_start|> and return text only (for external TTS)
+    pub text_only: bool,
 }
 
 impl Default for InterleavedOptions {
@@ -56,6 +58,7 @@ impl Default for InterleavedOptions {
             audio_top_k: 4,
             interleaved_n_text: None,
             interleaved_n_audio: None,
+            text_only: false,
         }
     }
 }
@@ -451,9 +454,17 @@ impl<'a> InterleavedPipeline<'a> {
                 }
 
                 if token == special.audio_start {
+                    // Text-only mode: stop here and return text for external TTS
+                    if options.text_only {
+                        break;
+                    }
                     in_audio_mode = true;
                     modality_left = interleaved_n_audio;
                 } else if modality_left == 0 || text_done {
+                    // Text-only mode: stop here too
+                    if options.text_only {
+                        break;
+                    }
                     in_audio_mode = true;
                     modality_left = interleaved_n_audio;
                 }

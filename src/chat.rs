@@ -52,6 +52,11 @@ impl<'a> ChatSession<'a> {
         }
     }
 
+    /// Set text-only mode (for external TTS like KittenTTS)
+    pub fn set_text_only(&mut self, text_only: bool) {
+        self.options.text_only = text_only;
+    }
+
     /// Add user audio turn
     pub fn add_user_audio(&mut self, audio: &[f32], sample_rate: u32) -> Result<()> {
         self.add_user_audio_with_text(audio, sample_rate, None)

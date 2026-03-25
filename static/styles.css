@@ -279,8 +279,24 @@ audio {
 
 .hint {
   color: var(--muted);
-  font-size: 14px;
-  margin: 0 0 12px;
+  font-size: 13px;
+  margin: 4px 0 0;
+  line-height: 1.4;
+}
+
+.toggle.compact {
+  margin-top: 12px;
+}
+
+.toggle.compact .label-with-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toggle.compact .hint {
+  margin-top: 4px;
+  margin-left: 0;
 }
 
 select {
