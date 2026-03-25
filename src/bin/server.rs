@@ -38,7 +38,11 @@ use lfm2_audio::{
     InterleavedOptions, LFM2Audio, Precision, TTSOptions,
 };
 
+#[cfg(feature = "kitten-tts")]
+use kitten_tts::model::KittenTTS;
+
 const DEFAULT_MODEL_DIR: &str = "/home/aurel/Documents/vibe/STT-rust/LFM2.5-Audio-1.5B-ONNX";
+const DEFAULT_KITTEN_TTS_DIR: &str = "/home/aurel/Documents/vibe/STT-rust/kitten-tts-models/kitten-tts-nano-int8";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_SYSTEM_PROMPT_INTERLEAVED: &str = "Respond with interleaved text and audio.";
 const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
@@ -53,6 +57,8 @@ struct AppState {
     next_session_id: Arc<AtomicU64>,
     next_worker: Arc<AtomicUsize>,
     session_workers: Arc<AsyncMutex<HashMap<u64, usize>>>,
+    #[cfg(feature = "kitten-tts")]
+    kitten_tts: Option<Arc<AsyncMutex<KittenTTS>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +72,8 @@ struct ServerConfig {
     interleaved_n_text: Option<usize>,
     interleaved_n_audio: Option<usize>,
     stream_decode: StreamingDecodeConfig,
+    /// Path to KittenTTS model (optional, for lightweight TTS)
+    kitten_tts_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -154,6 +162,9 @@ impl ServerConfig {
         let mut interleaved_n_audio = env::var("LFM2_INTERLEAVED_N_AUDIO")
             .ok()
             .and_then(|value| value.parse().ok());
+        let mut kitten_tts_path: Option<PathBuf> = env::var("LFM2_KITTEN_TTS_PATH")
+            .ok()
+            .map(PathBuf::from);
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -228,6 +239,12 @@ impl ServerConfig {
                             .context("invalid --interleaved-n-audio value")?,
                     );
                 }
+                "--kitten-tts-path" => {
+                    kitten_tts_path = Some(PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| anyhow!("missing value for --kitten-tts-path"))?,
+                    ));
+                }
                 other => return Err(anyhow!("unknown argument: {}", other)),
             }
         }
@@ -245,6 +262,10 @@ impl ServerConfig {
                 stream_batch_frames,
                 stream_context_frames,
             ),
+            #[cfg(feature = "kitten-tts")]
+            kitten_tts_path,
+            #[cfg(not(feature = "kitten-tts"))]
+            kitten_tts_path: None,
         })
     }
 }
@@ -388,6 +409,9 @@ struct TtsRequest {
     audio_temperature: Option<f32>,
     #[serde(default)]
     audio_top_k: Option<usize>,
+    /// TTS backend to use: "lfm2" (default) or "kitten" (lightweight, ~50ms/frame)
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 #[derive(Debug)]
@@ -897,6 +921,30 @@ async fn main() -> Result<()> {
         config.stream_decode.context_frames,
     );
 
+    // Load KittenTTS model if path is provided and feature is enabled
+    #[cfg(feature = "kitten-tts")]
+    let kitten_tts = if let Some(ref path) = config.kitten_tts_path {
+        if path.exists() {
+            info!("Loading KittenTTS model from {}...", path.display());
+            match KittenTTS::from_dir(path) {
+                Ok(model) => {
+                    info!("KittenTTS model loaded successfully (25MB, ~50ms/frame)");
+                    Some(Arc::new(AsyncMutex::new(model)))
+                }
+                Err(e) => {
+                    warn!("Failed to load KittenTTS model: {}. Using LFM2 TTS only.", e);
+                    None
+                }
+            }
+        } else {
+            warn!("KittenTTS path specified but not found: {}", path.display());
+            None
+        }
+    } else {
+        info!("KittenTTS not configured (use --kitten-tts-path or LFM2_KITTEN_TTS_PATH)");
+        None
+    };
+
     let mut workers = Vec::with_capacity(worker_count);
     for worker_index in 0..worker_count {
         let model_path = config.model_path.clone();
@@ -930,6 +978,8 @@ async fn main() -> Result<()> {
         next_session_id: Arc::new(AtomicU64::new(1)),
         next_worker: Arc::new(AtomicUsize::new(0)),
         session_workers: Arc::new(AsyncMutex::new(HashMap::new())),
+        #[cfg(feature = "kitten-tts")]
+        kitten_tts,
     };
 
     let app = build_router(&config, state);
@@ -1445,6 +1495,10 @@ async fn transcribe_raw(
     Ok(Json(response))
 }
 
+/// Given the TTS request, returns WAV bytes.
+/// Supports two backends:
+/// - "lfm2" (default): LFM2's built-in TTS (~90ms/frame, interleaved capable)
+/// - "kitten": KittenTTS-nano (~50ms/frame, standalone TTS only, requires --features kitten-tts)
 async fn synthesize(
     State(state): State<AppState>,
     Json(request): Json<TtsRequest>,
@@ -1453,6 +1507,32 @@ async fn synthesize(
         return Err(ApiError::bad_request("text must not be empty"));
     }
 
+    // Check if KittenTTS backend is requested
+    #[cfg(feature = "kitten-tts")]
+    if request.backend.as_deref() == Some("kitten") {
+        if let Some(ref kitten_tts) = state.kitten_tts {
+            info!("Using KittenTTS backend for TTS request");
+            let mut model = kitten_tts.lock().await;
+            
+            let voice = request.voice.as_deref().unwrap_or("Bella");
+            let speed = 1.0;
+            
+            let audio = model
+                .generate(&request.text, voice, speed, true)
+                .map_err(|e| ApiError::internal(format!("KittenTTS error: {}", e)))?;
+            
+            let wav_bytes = encode_wav_bytes(&audio, 24_000)
+                .map_err(|e| ApiError::internal(format!("WAV encoding error: {}", e)))?;
+            
+            return Ok(([(header::CONTENT_TYPE, "audio/wav")], wav_bytes).into_response());
+        } else {
+            return Err(ApiError::bad_request(
+                "KittenTTS backend requested but not loaded. Use --kitten-tts-path to configure.",
+            ));
+        }
+    }
+
+    // Default: use LFM2 TTS via model worker
     let (reply_tx, reply_rx) = oneshot::channel();
     let worker_index = next_worker_index(&state);
     state.workers[worker_index]
