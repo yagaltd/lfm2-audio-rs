@@ -43,8 +43,8 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_SYSTEM_PROMPT_INTERLEAVED: &str = "Respond with interleaved text and audio.";
 const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
-const STREAM_DECODE_BATCH_FRAMES: usize = 1;
-const STREAM_DECODE_CONTEXT_FRAMES: usize = 16;
+const STREAM_DECODE_BATCH_FRAMES: usize = 4;
+const STREAM_DECODE_CONTEXT_FRAMES: usize = 0;
 const STREAM_OUTPUT_QUEUE_CHUNKS: usize = 4;
 
 #[derive(Clone)]
@@ -84,7 +84,7 @@ impl StreamingDecodeConfig {
     fn new(batch_frames: usize, context_frames: usize) -> Self {
         Self {
             batch_frames: batch_frames.max(1),
-            context_frames: context_frames.max(1),
+            context_frames: context_frames,
         }
     }
 }
