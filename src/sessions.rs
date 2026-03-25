@@ -99,7 +99,7 @@ impl SessionLoader {
             .map_err(|e| LFM2Error::Onnx(e.into()))?
             .with_memory_pattern(true)
             .map_err(|e| LFM2Error::Onnx(e.into()))?
-            .with_intra_threads(4)
+            .with_intra_threads(8)
             .map_err(|e| LFM2Error::Onnx(e.into()))?;
 
         // Set execution providers
@@ -141,7 +141,7 @@ impl SessionLoader {
             .map_err(|e| LFM2Error::Onnx(e.into()))?
             .with_memory_pattern(true)
             .map_err(|e| LFM2Error::Onnx(e.into()))?
-            .with_intra_threads(4)
+            .with_intra_threads(8)
             .map_err(|e| LFM2Error::Onnx(e.into()))?;
 
         let eps = self.device.execution_providers();
