@@ -64,7 +64,9 @@ All source files may be modified:
 - After batch_frames=1: ~1200ms
 - After context_frames=0: ~519ms
 - After intra_threads=8: ~324ms
-- **Current (batch_frames=1, context_frames=0, intra_threads=8)**: `max_frame_gap_ms` **324ms**, RTF **0.969**
+- **Final (batch_frames=1, context_frames=0, intra_threads=8)**: `max_frame_gap_ms` **342ms**, RTF **0.961**
+
+**Optimization Limit Reached**: Target of <30ms not achievable within constraints.
 
 ## What's Been Tried
 
