@@ -93,9 +93,11 @@ impl SessionLoader {
         let mut builder = ort::session::Session::builder()
             .map_err(|e| LFM2Error::Onnx(e.into()))?;
 
-        // Set optimization level
+        // Set optimization level and memory pattern
         builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| LFM2Error::Onnx(e.into()))?
+            .with_memory_pattern(true)
             .map_err(|e| LFM2Error::Onnx(e.into()))?;
 
         // Set execution providers
@@ -134,6 +136,8 @@ impl SessionLoader {
 
         builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| LFM2Error::Onnx(e.into()))?
+            .with_memory_pattern(true)
             .map_err(|e| LFM2Error::Onnx(e.into()))?;
 
         let eps = self.device.execution_providers();
