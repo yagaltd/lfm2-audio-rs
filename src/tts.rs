@@ -824,7 +824,7 @@ pub fn decode_audio_codes_standalone(
     // Run audio detokenizer
     let outputs = detokenizer.run(ort::inputs! {
         "audio_codes" => t_codes,
-    }).map_err(|e| LFM2Error::Onnx(e.into()))?;
+    }).map_err(LFM2Error::Onnx)?;
 
     // Extract features
     let features_output = outputs.get("stft_features")
@@ -835,8 +835,9 @@ pub fn decode_audio_codes_standalone(
             "detokenizer output not found".to_string()
         ))?;
 
-    let view = features_output.try_extract_array::<f32>()
-        .map_err(|e| LFM2Error::Onnx(e.into()))?;
+    let view = features_output
+        .try_extract_array::<f32>()
+        .map_err(LFM2Error::Onnx)?;
     let shape = view.shape();
     
     let (out_frames, feature_dim) = if shape.len() == 3 {

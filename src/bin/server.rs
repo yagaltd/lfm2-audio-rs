@@ -22,7 +22,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -43,9 +43,9 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_SYSTEM_PROMPT_INTERLEAVED: &str = "Respond with interleaved text and audio.";
 const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
-const STREAM_DECODE_BATCH_FRAMES: usize = 1;
-const STREAM_DECODE_CONTEXT_FRAMES: usize = 0;
-const STREAM_OUTPUT_QUEUE_CHUNKS: usize = 4;
+const STREAM_DECODE_BATCH_FRAMES: usize = 4;
+const STREAM_DECODE_CONTEXT_FRAMES: usize = 16;
+const STREAM_OUTPUT_QUEUE_CHUNKS: usize = 2;
 
 #[derive(Clone)]
 struct AppState {
@@ -154,10 +154,6 @@ impl ServerConfig {
         let mut interleaved_n_audio = env::var("LFM2_INTERLEAVED_N_AUDIO")
             .ok()
             .and_then(|value| value.parse().ok());
-        let mut kitten_tts_path: Option<PathBuf> = env::var("LFM2_KITTEN_TTS_PATH")
-            .ok()
-            .map(PathBuf::from);
-
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -230,12 +226,6 @@ impl ServerConfig {
                             .parse()
                             .context("invalid --interleaved-n-audio value")?,
                     );
-                }
-                "--kitten-tts-path" => {
-                    kitten_tts_path = Some(PathBuf::from(
-                        args.next()
-                            .ok_or_else(|| anyhow!("missing value for --kitten-tts-path"))?,
-                    ));
                 }
                 other => return Err(anyhow!("unknown argument: {}", other)),
             }
@@ -397,9 +387,6 @@ struct TtsRequest {
     audio_temperature: Option<f32>,
     #[serde(default)]
     audio_top_k: Option<usize>,
-    /// TTS backend to use: "lfm2" (default) or "kitten" (lightweight, ~50ms/frame)
-    #[serde(default)]
-    backend: Option<String>,
 }
 
 #[derive(Debug)]
@@ -456,8 +443,6 @@ enum ModelCommand {
     SessionText {
         session_id: u64,
         text: String,
-        /// If true, generate text only (for external TTS like KittenTTS)
-        text_only: bool,
         stream: mpsc::Sender<AssistantStreamEvent>,
         reply: oneshot::Sender<ApiResult<AssistantTurn>>,
     },
@@ -466,8 +451,6 @@ enum ModelCommand {
         audio: Vec<f32>,
         sample_rate: u32,
         text_prompt: Option<String>,
-        /// If true, generate text only (for external TTS like KittenTTS)
-        text_only: bool,
         stream: mpsc::Sender<AssistantStreamEvent>,
         reply: oneshot::Sender<ApiResult<AssistantTurn>>,
     },
@@ -478,191 +461,6 @@ enum ModelCommand {
     SessionClose {
         session_id: u64,
     },
-}
-
-/// LFM2 detokenizer ISTFT parameters
-/// Each audio frame produces hop_length samples (320 at 24kHz = ~13.3ms)
-const HOP_LENGTH: usize = 320;
-const WIN_LENGTH: usize = 1280;
-const N_FFT: usize = 1280;
-
-/// Request to decode audio codes in background thread
-struct AsyncDecodeRequest {
-    codes: Vec<[u16; 8]>,
-    request_id: u64,
-}
-
-/// Result from background decode
-struct AsyncDecodeResult {
-    request_id: u64,
-    waveform: Result<Vec<f32>, String>,
-    decode_elapsed_ms: u64,
-}
-
-/// Background decode thread handle
-struct AsyncDecodeThread {
-    /// Channel to send decode requests
-    request_tx: std::sync::mpsc::Sender<AsyncDecodeRequest>,
-    /// Channel to receive decode results
-    result_rx: std::sync::mpsc::Receiver<AsyncDecodeResult>,
-}
-
-impl AsyncDecodeThread {
-    fn spawn(detokenizer: Arc<Mutex<ort::session::Session>>) -> Self {
-        let (request_tx, request_rx): (std::sync::mpsc::Sender<AsyncDecodeRequest>, _) = std::sync::mpsc::channel();
-        let (result_tx, result_rx): (_, std::sync::mpsc::Receiver<AsyncDecodeResult>) = std::sync::mpsc::channel();
-        
-        std::thread::Builder::new()
-            .name("async-decode".to_string())
-            .spawn(move || {
-                while let Ok(req) = request_rx.recv() {
-                    let decode_started = Instant::now();
-                    let mut session = detokenizer.lock().unwrap();
-                    let waveform = lfm2_audio::decode_audio_codes_standalone(&mut session, &req.codes)
-                        .map_err(|e| e.to_string());
-                    let decode_elapsed_ms = decode_started.elapsed().as_millis() as u64;
-                    if result_tx.send(AsyncDecodeResult { 
-                        request_id: req.request_id, 
-                        waveform,
-                        decode_elapsed_ms,
-                    }).is_err() {
-                        break;
-                    }
-                }
-            })
-            .expect("failed to spawn async decode thread");
-        
-        Self { request_tx, result_rx }
-    }
-    
-    fn request_decode(&self, codes: Vec<[u16; 8]>, request_id: u64) -> ApiResult<()> {
-        self.request_tx
-            .send(AsyncDecodeRequest { codes, request_id })
-            .map_err(|_| ApiError::internal("decode thread disconnected"))?;
-        Ok(())
-    }
-    
-    fn try_recv(&self) -> Option<AsyncDecodeResult> {
-        self.result_rx.try_recv().ok()
-    }
-}
-
-/// Async streaming decoder that decodes frames in background thread
-/// while generation continues. Maintains ordering via request IDs.
-struct AsyncStreamingDecoder {
-    async_decode: Arc<AsyncDecodeThread>,
-    session_id: u64,
-    /// Next request ID to assign
-    next_request_id: u64,
-    /// Request IDs in order they were submitted
-    pending_order: VecDeque<u64>,
-    /// Completed results keyed by request_id
-    completed: HashMap<u64, AsyncDecodeResult>,
-    /// Number of samples per frame (1920 at 24kHz)
-    samples_per_frame: usize,
-}
-
-impl AsyncStreamingDecoder {
-    fn new(async_decode: Arc<AsyncDecodeThread>, session_id: u64) -> Self {
-        Self {
-            async_decode,
-            session_id,
-            next_request_id: 0,
-            pending_order: VecDeque::new(),
-            completed: HashMap::new(),
-            samples_per_frame: 1920, // 80ms at 24kHz
-        }
-    }
-    
-    /// Submit a frame for async decode. Returns immediately.
-    /// Call poll_completed() to get results.
-    fn push_frame(&mut self, frame: [u16; 8]) -> ApiResult<()> {
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
-        self.pending_order.push_back(request_id);
-        
-        // Submit single frame for decode (batch_frames=1, context_frames=0)
-        self.async_decode.request_decode(vec![frame], request_id)?;
-        
-        Ok(())
-    }
-    
-    /// Poll for completed decodes and return chunks in order.
-    /// Returns all completed chunks that are ready in order.
-    fn poll_completed(&mut self) -> ApiResult<Vec<DecodedAudioChunk>> {
-        // Collect all available results
-        while let Some(result) = self.async_decode.try_recv() {
-            self.completed.insert(result.request_id, result);
-        }
-        
-        let mut chunks = Vec::new();
-        
-        // Return completed chunks in order
-        while let Some(&request_id) = self.pending_order.front() {
-            if let Some(result) = self.completed.remove(&request_id) {
-                self.pending_order.pop_front();
-                
-                let waveform = result.waveform
-                    .map_err(|e| ApiError::internal(e))?;
-                
-                let decode_index = request_id as usize + 1;
-                
-                info!(
-                    session_id = self.session_id,
-                    decode_index,
-                    request_id,
-                    decode_elapsed_ms = result.decode_elapsed_ms,
-                    samples = waveform.len(),
-                    "async decode completed"
-                );
-                
-                chunks.push(DecodedAudioChunk {
-                    bytes: encode_pcm_s16le_bytes(&waveform),
-                    decode_index,
-                    emitted_samples: waveform.len(),
-                    decode_elapsed_ms: result.decode_elapsed_ms,
-                    backend: "async-onnx",
-                });
-            } else {
-                // Next in order not ready yet
-                break;
-            }
-        }
-        
-        Ok(chunks)
-    }
-    
-    /// Finish: wait for all pending decodes to complete.
-    /// Returns any remaining chunks in order.
-    fn finish(&mut self) -> ApiResult<Vec<DecodedAudioChunk>> {
-        // Wait for all pending decodes with timeout
-        let timeout = Duration::from_secs(30);
-        let start = Instant::now();
-        
-        while !self.pending_order.is_empty() && start.elapsed() < timeout {
-            // Poll for new results
-            if let Some(result) = self.async_decode.try_recv() {
-                self.completed.insert(result.request_id, result);
-            } else {
-                // Brief sleep to avoid busy-waiting
-                std::thread::sleep(Duration::from_micros(100));
-            }
-            
-            // Check if front of queue is ready
-            if let Some(request_id) = self.pending_order.front() {
-                if self.completed.contains_key(request_id) {
-                    // poll_completed will return this chunk
-                }
-            }
-        }
-        
-        self.poll_completed()
-    }
-    
-    /// Check if there are pending decodes
-    fn has_pending(&self) -> bool {
-        !self.pending_order.is_empty()
-    }
 }
 
 struct OnnxStreamingAudioDecoder<'a> {
@@ -817,9 +615,6 @@ enum ClientWsMessage {
     SessionStart {
         #[serde(default)]
         system_prompt: Option<String>,
-        /// TTS backend: "lfm2" (default) or "kitten" (hybrid mode with faster TTS)
-        #[serde(default)]
-        tts_backend: Option<String>,
     },
     #[serde(rename = "user.text")]
     UserText { text: String },
@@ -889,13 +684,6 @@ struct PendingAudioTurn {
     bytes: Vec<u8>,
 }
 
-/// Session-level settings that persist across turns
-#[derive(Debug, Clone, Default)]
-struct SessionSettings {
-    /// TTS backend: "lfm2" (default) or "kitten" (hybrid mode)
-    tts_backend: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -922,30 +710,6 @@ async fn main() -> Result<()> {
         config.stream_decode.batch_frames,
         config.stream_decode.context_frames,
     );
-
-    // Load KittenTTS model if path is provided and feature is enabled
-    #[cfg(feature = "kitten-tts")]
-    let kitten_tts = if let Some(ref path) = config.kitten_tts_path {
-        if path.exists() {
-            info!("Loading KittenTTS model from {}...", path.display());
-            match KittenTTS::from_dir(path) {
-                Ok(model) => {
-                    info!("KittenTTS model loaded successfully (25MB, ~50ms/frame)");
-                    Some(Arc::new(AsyncMutex::new(model)))
-                }
-                Err(e) => {
-                    warn!("Failed to load KittenTTS model: {}. Using LFM2 TTS only.", e);
-                    None
-                }
-            }
-        } else {
-            warn!("KittenTTS path specified but not found: {}", path.display());
-            None
-        }
-    } else {
-        info!("KittenTTS not configured (use --kitten-tts-path or LFM2_KITTEN_TTS_PATH)");
-        None
-    };
 
     let mut workers = Vec::with_capacity(worker_count);
     for worker_index in 0..worker_count {
@@ -980,8 +744,6 @@ async fn main() -> Result<()> {
         next_session_id: Arc::new(AtomicU64::new(1)),
         next_worker: Arc::new(AtomicUsize::new(0)),
         session_workers: Arc::new(AsyncMutex::new(HashMap::new())),
-        #[cfg(feature = "kitten-tts")]
-        kitten_tts,
     };
 
     let app = build_router(&config, state);
@@ -1052,10 +814,6 @@ fn model_worker(
     interleaved_overrides: InterleavedOverrides,
 ) {
     let mut sessions: HashMap<u64, lfm2_audio::ChatSession<'static>> = HashMap::new();
-    
-    // Create async decode thread for background ONNX inference
-    let audio_detokenizer = model.sessions().audio_detokenizer.clone();
-    let async_decode = Arc::new(AsyncDecodeThread::spawn(audio_detokenizer));
 
     while let Some(command) = rx.blocking_recv() {
         match command {
@@ -1116,34 +874,29 @@ fn model_worker(
             ModelCommand::SessionText {
                 session_id,
                 text,
-                text_only,
                 stream,
                 reply,
             } => {
                 info!(
                     session_id,
                     text_len = text.len(),
-                    text_only,
                     "streaming text turn started"
                 );
                 let session = sessions.entry(session_id).or_insert_with(|| {
-                    let prompt = if text_only {
-                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED
-                    } else {
-                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED
-                    };
                     model.chat_with_options(apply_interleaved_overrides(
-                        prompt.to_string(),
+                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED.to_string(),
                         interleaved_overrides,
                     ))
                 });
-                info!(session_id, text_only, "SessionText: text_only mode set");
                 session.add_user_text(&text);
-                // Use async decoder for background ONNX inference
-                let mut audio_decoder = AsyncStreamingDecoder::new(
-                    async_decode.clone(),
-                    session_id,
-                );
+                let mut audio_decoder =
+                    match StreamingAudioDecoder::new(model, stream_decode, session_id) {
+                        Ok(decoder) => decoder,
+                        Err(err) => {
+                            let _ = reply.send(Err(err));
+                            continue;
+                        }
+                    };
                 let stream_started_at = Instant::now();
                 let mut emitted_audio_chunks = 0usize;
                 let mut emitted_audio_bytes = 0usize;
@@ -1175,17 +928,10 @@ fn model_worker(
                                     frame_gap_ms,
                                     "audio frame generated"
                                 );
-                                // Submit frame for async decode (non-blocking)
-                                audio_decoder
+                                if let Some(chunk) = audio_decoder
                                     .push_frame(frame)
-                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
-                                
-                                // Poll for any completed decodes and send them
-                                let completed = audio_decoder
-                                    .poll_completed()
-                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
-                                
-                                for chunk in completed {
+                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
+                                {
                                     emitted_audio_chunks += 1;
                                     emitted_audio_bytes += chunk.bytes.len();
                                     let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
@@ -1225,12 +971,10 @@ fn model_worker(
                     })
                     .map_err(|err| ApiError::internal(err.to_string()))
                     .and_then(|response| {
-                        // Finish: wait for all pending async decodes
-                        let final_chunks = audio_decoder
+                        if let Some(chunk) = audio_decoder
                             .finish()
-                            .map_err(|err| ApiError::internal(err.message))?;
-                        
-                        for chunk in final_chunks {
+                            .map_err(|err| ApiError::internal(err.message))?
+                        {
                             emitted_audio_chunks += 1;
                             emitted_audio_bytes += chunk.bytes.len();
                             let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
@@ -1278,7 +1022,6 @@ fn model_worker(
                 audio,
                 sample_rate,
                 text_prompt,
-                text_only,
                 stream,
                 reply,
             } => {
@@ -1289,29 +1032,24 @@ fn model_worker(
                     input_duration_ms = ((audio.len() as f64 / sample_rate as f64) * 1000.0)
                         .round() as u64,
                     has_text_prompt = text_prompt.is_some(),
-                    text_only,
                     "streaming audio turn started"
                 );
                 let session = sessions.entry(session_id).or_insert_with(|| {
-                    let prompt = if text_only {
-                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED
-                    } else {
-                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED
-                    };
                     model.chat_with_options(apply_interleaved_overrides(
-                        prompt.to_string(),
+                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED.to_string(),
                         interleaved_overrides,
                     ))
                 });
-                // Set text-only mode for external TTS (KittenTTS)
-                info!(session_id, text_only, "SessionAudio: text_only mode set");
                 let add_result =
                     session.add_user_audio_with_text(&audio, sample_rate, text_prompt.as_deref());
-                // Use async decoder for background ONNX inference
-                let mut audio_decoder = AsyncStreamingDecoder::new(
-                    async_decode.clone(),
-                    session_id,
-                );
+                let mut audio_decoder =
+                    match StreamingAudioDecoder::new(model, stream_decode, session_id) {
+                        Ok(decoder) => decoder,
+                        Err(err) => {
+                            let _ = reply.send(Err(err));
+                            continue;
+                        }
+                    };
                 let stream_started_at = Instant::now();
                 let mut emitted_audio_chunks = 0usize;
                 let mut emitted_audio_bytes = 0usize;
@@ -1346,17 +1084,10 @@ fn model_worker(
                                             frame_gap_ms,
                                             "audio frame generated"
                                         );
-                                        // Submit frame for async decode (non-blocking)
-                                        audio_decoder
+                                        if let Some(chunk) = audio_decoder
                                             .push_frame(frame)
-                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
-                                        
-                                        // Poll for any completed decodes and send them
-                                        let completed = audio_decoder
-                                            .poll_completed()
-                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
-                                        
-                                        for chunk in completed {
+                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
+                                        {
                                             emitted_audio_chunks += 1;
                                             emitted_audio_bytes += chunk.bytes.len();
                                             let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
@@ -1396,12 +1127,10 @@ fn model_worker(
                             })
                             .map_err(|err| ApiError::internal(err.to_string()))
                             .and_then(|response| {
-                                // Finish: wait for all pending async decodes
-                                let final_chunks = audio_decoder
+                                if let Some(chunk) = audio_decoder
                                     .finish()
-                                    .map_err(|err| ApiError::internal(err.message))?;
-                                
-                                for chunk in final_chunks {
+                                    .map_err(|err| ApiError::internal(err.message))?
+                                {
                                     emitted_audio_chunks += 1;
                                     emitted_audio_bytes += chunk.bytes.len();
                                     let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
@@ -1515,9 +1244,6 @@ async fn transcribe_raw(
 }
 
 /// Given the TTS request, returns WAV bytes.
-/// Supports two backends:
-/// - "lfm2" (default): LFM2's built-in TTS (~90ms/frame, interleaved capable)
-/// - "kitten": KittenTTS-nano (~50ms/frame, standalone TTS only, requires --features kitten-tts)
 async fn synthesize(
     State(state): State<AppState>,
     Json(request): Json<TtsRequest>,
@@ -1525,33 +1251,6 @@ async fn synthesize(
     if request.text.trim().is_empty() {
         return Err(ApiError::bad_request("text must not be empty"));
     }
-
-    // Check if KittenTTS backend is requested
-    #[cfg(feature = "kitten-tts")]
-    if request.backend.as_deref() == Some("kitten") {
-        if let Some(ref kitten_tts) = state.kitten_tts {
-            info!("Using KittenTTS backend for TTS request");
-            let mut model = kitten_tts.lock().await;
-            
-            let voice = request.voice.as_deref().unwrap_or("Bella");
-            let speed = 1.0;
-            
-            let audio = model
-                .generate(&request.text, voice, speed, true)
-                .map_err(|e| ApiError::internal(format!("KittenTTS error: {}", e)))?;
-            
-            let wav_bytes = encode_wav_bytes(&audio, 24_000)
-                .map_err(|e| ApiError::internal(format!("WAV encoding error: {}", e)))?;
-            
-            return Ok(([(header::CONTENT_TYPE, "audio/wav")], wav_bytes).into_response());
-        } else {
-            return Err(ApiError::bad_request(
-                "KittenTTS backend requested but not loaded. Use --kitten-tts-path to configure.",
-            ));
-        }
-    }
-
-    // Default: use LFM2 TTS via model worker
     let (reply_tx, reply_rx) = oneshot::channel();
     let worker_index = next_worker_index(&state);
     state.workers[worker_index]
@@ -1579,7 +1278,6 @@ async fn interleaved_socket(
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     let session_id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
     let mut pending_audio: Option<PendingAudioTurn> = None;
-    let mut session_settings: SessionSettings = SessionSettings::default();
 
     if let Err(err) =
         send_ws_json(&mut socket, &ServerWsMessage::Status { phase: "listening" }).await
@@ -1611,7 +1309,6 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         &state,
                         session_id,
                         &mut pending_audio,
-                        &mut session_settings,
                         payload,
                     )
                     .await
@@ -1653,19 +1350,10 @@ async fn handle_client_message(
     state: &AppState,
     session_id: u64,
     pending_audio: &mut Option<PendingAudioTurn>,
-    session_settings: &mut SessionSettings,
     payload: ClientWsMessage,
 ) -> ApiResult<()> {
     match payload {
-        ClientWsMessage::SessionStart { system_prompt, tts_backend } => {
-            // Store the TTS backend preference for this session
-            if let Some(backend) = tts_backend {
-                info!(session_id, tts_backend = %backend, "Session TTS backend set");
-                session_settings.tts_backend = backend;
-            } else {
-                info!(session_id, "Session using default TTS backend (lfm2)");
-            }
-            
+        ClientWsMessage::SessionStart { system_prompt } => {
             let prompt =
                 system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT_INTERLEAVED.to_string());
             let worker_index = session_worker_index(state, session_id).await;
@@ -1696,95 +1384,23 @@ async fn handle_client_message(
                 },
             )
             .await?;
-            
-            // Use text-only mode for hybrid pipeline (LFM2 text → KittenTTS audio)
-            let text_only = session_settings.tts_backend == "kitten";
-            info!(session_id, tts_backend = %session_settings.tts_backend, text_only, "Processing text turn");
             let worker_index = session_worker_index(state, session_id).await;
             let (reply_tx, reply_rx) = oneshot::channel();
             let (stream_tx, mut stream_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
-            
-            // Use text-only mode for hybrid pipeline (LFM2 text → KittenTTS audio)
-            let text_only = session_settings.tts_backend == "kitten";
-            
+
             state.workers[worker_index]
                 .send(ModelCommand::SessionText {
                     session_id,
                     text,
-                    text_only,
                     stream: stream_tx,
                     reply: reply_tx,
                 })
                 .await
                 .map_err(|_| ApiError::internal("model worker unavailable"))?;
             let _ = send_streaming_assistant_events(socket, &mut stream_rx).await?;
-            let mut response = reply_rx
+            let response = reply_rx
                 .await
                 .map_err(|_| ApiError::internal("text reply dropped"))??;
-
-            // Hybrid mode: synthesize text with KittenTTS instead of LFM2 audio codes
-            #[cfg(feature = "kitten-tts")]
-            if session_settings.tts_backend == "kitten" {
-                if let Some(ref kitten_tts) = state.kitten_tts {
-                    if !response.text.trim().is_empty() {
-                        info!(
-                            session_id,
-                            text_len = response.text.len(),
-                            text_preview = %response.text.chars().take(100).collect::<String>(),
-                            "Synthesizing with KittenTTS (text turn)"
-                        );
-                        
-                        let mut model = kitten_tts.lock().await;
-                        let synthesis_start = Instant::now();
-                        
-                        match model.generate(&response.text, "Bella", 1.0, true) {
-                            Ok(audio) => {
-                                let synthesis_ms = synthesis_start.elapsed().as_millis();
-                                info!(
-                                    session_id,
-                                    samples = audio.len(),
-                                    duration_ms = (audio.len() as f64 / 24000.0 * 1000.0) as u64,
-                                    synthesis_ms,
-                                    "KittenTTS synthesis complete"
-                                );
-                                
-                                // Send audio start message
-                                send_ws_json(
-                                    socket,
-                                    &ServerWsMessage::AssistantAudioStart {
-                                        sample_rate: 24000,
-                                        format: "pcm_f32le",
-                                        channels: 1,
-                                        chunk_samples: audio.len(),
-                                    },
-                                )
-                                .await?;
-                                
-                                // Send audio chunk
-                                let audio_bytes: Vec<u8> = audio
-                                    .iter()
-                                    .flat_map(|&s| s.to_le_bytes())
-                                    .collect();
-                                socket
-                                    .send(Message::Binary(audio_bytes.into()))
-                                    .await
-                                    .map_err(|err| ApiError::internal(err.to_string()))?;
-                                
-                                // Send audio end
-                                send_ws_json(socket, &ServerWsMessage::AssistantAudioEnd).await?;
-                            }
-                            Err(e) => {
-                                warn!(session_id, error = %e, "KittenTTS synthesis failed");
-                            }
-                        }
-                    }
-                } else {
-                    warn!(
-                        session_id,
-                        "KittenTTS backend requested but model not loaded. Use --kitten-tts-path."
-                    );
-                }
-            }
 
             send_assistant_turn(socket, &response).await?;
             send_ws_json(socket, &ServerWsMessage::Status { phase: "listening" }).await?;
@@ -1836,17 +1452,13 @@ async fn handle_client_message(
             let chat_text_prompt = text_prompt.clone();
             let (chat_tx, chat_rx) = oneshot::channel();
             let (stream_tx, mut stream_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
-            
-            // Use text-only mode for hybrid pipeline (LFM2 text → KittenTTS audio)
-            let text_only = session_settings.tts_backend == "kitten";
-            
+
             state.workers[worker_index]
                 .send(ModelCommand::SessionAudio {
                     session_id,
                     audio: chat_audio,
                     sample_rate: pending.sample_rate,
                     text_prompt: chat_text_prompt,
-                    text_only,
                     stream: stream_tx,
                     reply: chat_tx,
                 })
@@ -1891,70 +1503,6 @@ async fn handle_client_message(
                     Err(_) => {
                         warn!("transcript worker dropped reply for session {}", session_id);
                     }
-                }
-            }
-
-            // Hybrid mode: synthesize text with KittenTTS instead of LFM2 audio codes
-            #[cfg(feature = "kitten-tts")]
-            if session_settings.tts_backend == "kitten" {
-                if let Some(ref kitten_tts) = state.kitten_tts {
-                    if !response.text.trim().is_empty() {
-                        info!(
-                            session_id,
-                            text_len = response.text.len(),
-                            text_preview = %response.text.chars().take(100).collect::<String>(),
-                            "Synthesizing with KittenTTS (audio turn)"
-                        );
-                        
-                        let mut model = kitten_tts.lock().await;
-                        let synthesis_start = Instant::now();
-                        
-                        match model.generate(&response.text, "Bella", 1.0, true) {
-                            Ok(audio) => {
-                                let synthesis_ms = synthesis_start.elapsed().as_millis();
-                                info!(
-                                    session_id,
-                                    samples = audio.len(),
-                                    duration_ms = (audio.len() as f64 / 24000.0 * 1000.0) as u64,
-                                    synthesis_ms,
-                                    "KittenTTS synthesis complete"
-                                );
-                                
-                                // Send audio start message
-                                send_ws_json(
-                                    socket,
-                                    &ServerWsMessage::AssistantAudioStart {
-                                        sample_rate: 24000,
-                                        format: "pcm_f32le",
-                                        channels: 1,
-                                        chunk_samples: audio.len(),
-                                    },
-                                )
-                                .await?;
-                                
-                                // Send audio chunk
-                                let audio_bytes: Vec<u8> = audio
-                                    .iter()
-                                    .flat_map(|&s| s.to_le_bytes())
-                                    .collect();
-                                socket
-                                    .send(Message::Binary(audio_bytes.into()))
-                                    .await
-                                    .map_err(|err| ApiError::internal(err.to_string()))?;
-                                
-                                // Send audio end
-                                send_ws_json(socket, &ServerWsMessage::AssistantAudioEnd).await?;
-                            }
-                            Err(e) => {
-                                warn!(session_id, error = %e, "KittenTTS synthesis failed");
-                            }
-                        }
-                    }
-                } else {
-                    warn!(
-                        session_id,
-                        "KittenTTS backend requested but model not loaded. Use --kitten-tts-path."
-                    );
                 }
             }
 
@@ -2324,7 +1872,7 @@ fn resolve_tts_system_prompt(system_prompt: Option<&str>, voice: Option<&str>) -
 mod tests {
     use super::{
         background_worker_index, chunk_playback_duration, effective_worker_count,
-        parse_device_preference,
+        parse_device_preference, STREAM_OUTPUT_QUEUE_CHUNKS,
         AudioOutputPacer, Device, DevicePreference, OutputQueueConfig, StreamingAudioDecoder,
     };
     use lfm2_audio::{LFM2Audio, Precision, TTSOptions};
@@ -2405,6 +1953,11 @@ mod tests {
 
         pacer.enqueue(start);
         assert_eq!(pacer.next_wake_delay(start), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn default_stream_output_queue_starts_after_two_chunks() {
+        assert_eq!(STREAM_OUTPUT_QUEUE_CHUNKS, 2);
     }
 
     fn get_model_path() -> Option<PathBuf> {

@@ -1,5 +1,6 @@
 import createVADModule from "/static/lib/Web/ten_vad.js";
 import { acceptAssistantAudioChunk } from "/static/assistant-stream-guard.js";
+import { buildSessionStartMessage } from "/static/session-start.js";
 
 const SAMPLE_RATE = 16000;
 const HOP_SIZE = 256;
@@ -327,10 +328,7 @@ function connectSocket() {
     setPhase("Listening");
     updateControls();
     log("WebSocket connected");
-    ws.send(JSON.stringify({
-      type: "session.start",
-      system_prompt: systemPromptInput.value.trim(),
-    }));
+    ws.send(JSON.stringify(buildSessionStartMessage(systemPromptInput.value.trim())));
   });
 
   ws.addEventListener("close", () => {
