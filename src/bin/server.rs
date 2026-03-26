@@ -254,10 +254,6 @@ impl ServerConfig {
                 stream_batch_frames,
                 stream_context_frames,
             ),
-            #[cfg(feature = "kitten-tts")]
-            kitten_tts_path,
-            #[cfg(not(feature = "kitten-tts"))]
-            kitten_tts_path: None,
         })
     }
 }
