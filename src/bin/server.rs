@@ -38,14 +38,9 @@ use lfm2_audio::{
     InterleavedOptions, LFM2Audio, Precision, TTSOptions,
 };
 
-#[cfg(feature = "kitten-tts")]
-use kitten_tts::model::KittenTTS;
-
 const DEFAULT_MODEL_DIR: &str = "/home/aurel/Documents/vibe/STT-rust/LFM2.5-Audio-1.5B-ONNX";
-const DEFAULT_KITTEN_TTS_DIR: &str = "/home/aurel/Documents/vibe/STT-rust/kitten-tts-models/kitten-tts-nano-int8";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_SYSTEM_PROMPT_INTERLEAVED: &str = "Respond with interleaved text and audio.";
-const DEFAULT_SYSTEM_PROMPT_TEXT_ONLY: &str = "Respond with text only. Do not generate audio.";
 const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_DECODE_BATCH_FRAMES: usize = 1;
@@ -58,8 +53,6 @@ struct AppState {
     next_session_id: Arc<AtomicU64>,
     next_worker: Arc<AtomicUsize>,
     session_workers: Arc<AsyncMutex<HashMap<u64, usize>>>,
-    #[cfg(feature = "kitten-tts")]
-    kitten_tts: Option<Arc<AsyncMutex<KittenTTS>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,8 +66,6 @@ struct ServerConfig {
     interleaved_n_text: Option<usize>,
     interleaved_n_audio: Option<usize>,
     stream_decode: StreamingDecodeConfig,
-    /// Path to KittenTTS model (optional, for lightweight TTS)
-    kitten_tts_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1141,7 +1132,7 @@ fn model_worker(
                 );
                 let session = sessions.entry(session_id).or_insert_with(|| {
                     let prompt = if text_only {
-                        DEFAULT_SYSTEM_PROMPT_TEXT_ONLY
+                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED
                     } else {
                         DEFAULT_SYSTEM_PROMPT_INTERLEAVED
                     };
@@ -1150,7 +1141,6 @@ fn model_worker(
                         interleaved_overrides,
                     ))
                 });
-                session.set_text_only(text_only);
                 info!(session_id, text_only, "SessionText: text_only mode set");
                 session.add_user_text(&text);
                 // Use async decoder for background ONNX inference
@@ -1308,7 +1298,7 @@ fn model_worker(
                 );
                 let session = sessions.entry(session_id).or_insert_with(|| {
                     let prompt = if text_only {
-                        DEFAULT_SYSTEM_PROMPT_TEXT_ONLY
+                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED
                     } else {
                         DEFAULT_SYSTEM_PROMPT_INTERLEAVED
                     };
@@ -1318,7 +1308,6 @@ fn model_worker(
                     ))
                 });
                 // Set text-only mode for external TTS (KittenTTS)
-                session.set_text_only(text_only);
                 info!(session_id, text_only, "SessionAudio: text_only mode set");
                 let add_result =
                     session.add_user_audio_with_text(&audio, sample_rate, text_prompt.as_deref());
