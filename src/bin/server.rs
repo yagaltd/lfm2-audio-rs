@@ -43,7 +43,7 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_SYSTEM_PROMPT_INTERLEAVED: &str = "Respond with interleaved text and audio.";
 const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
-const STREAM_DECODE_BATCH_FRAMES: usize = 4;
+const STREAM_DECODE_BATCH_FRAMES: usize = 2;
 const STREAM_DECODE_CONTEXT_FRAMES: usize = 16;
 const STREAM_OUTPUT_QUEUE_CHUNKS: usize = 2;
 
@@ -1882,8 +1882,9 @@ fn resolve_tts_system_prompt(system_prompt: Option<&str>, voice: Option<&str>) -
 mod tests {
     use super::{
         background_worker_index, chunk_playback_duration, effective_worker_count,
-        parse_device_preference, split_new_waveform_tail, STREAM_OUTPUT_QUEUE_CHUNKS,
-        AudioOutputPacer, Device, DevicePreference, OutputQueueConfig, StreamingAudioDecoder,
+        parse_device_preference, split_new_waveform_tail, STREAM_DECODE_BATCH_FRAMES,
+        STREAM_OUTPUT_QUEUE_CHUNKS, AudioOutputPacer, Device, DevicePreference,
+        OutputQueueConfig, StreamingAudioDecoder,
     };
     use lfm2_audio::{LFM2Audio, Precision, TTSOptions};
     use std::path::PathBuf;
@@ -1968,6 +1969,11 @@ mod tests {
     #[test]
     fn default_stream_output_queue_starts_after_two_chunks() {
         assert_eq!(STREAM_OUTPUT_QUEUE_CHUNKS, 2);
+    }
+
+    #[test]
+    fn default_stream_decode_batch_is_two_frames() {
+        assert_eq!(STREAM_DECODE_BATCH_FRAMES, 2);
     }
 
     #[test]

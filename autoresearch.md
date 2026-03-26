@@ -63,10 +63,12 @@ The script:
 - Previous branch work optimized frame-gap timing directly, but the current code inspection and websocket reproduction showed a more basic likely issue: streamed chunks were replaying overlapping waveform windows because server-side tail accounting was wrong.
 - Baseline on the honest websocket benchmark: `realtime_penalty_ms=15376`, `first_playable_audio_ms=1478`, `overlap_ms=13440`, holdout overlap `58240`. Replay completely dominated the user-visible penalty.
 - **Keep:** update `last_emitted_samples` immediately after each decode and slice new waveform tails from that tracked position. Result: `realtime_penalty_ms=2842`, `overlap_ms=0`, holdout overlap `0`. This fixed the correctness bug and removed the huge replay penalty.
-- After the tail fix, the dominant bottleneck is now starvation/throughput rather than overlap: `max_chunk_deficit_ms` increased to ~1.3–1.5s and first playable audio stayed around 1.54s.
+- **Keep:** reduce the default streaming decode batch from 4 frames to 2 frames. Result: `realtime_penalty_ms=2201`, `first_playable_audio_ms=910`, `max_chunk_deficit_ms=1332`, holdout penalty `2140`. This improved startup and chunk deficit without bringing overlap back, but total turn time jumped to ~43s and chunk count to 38.
+- **Crash/Discard insight:** a 1-frame batch improved startup further (~0.6s first playable) but exploded chunk count enough that the tune suite stopped completing reliably under the harness.
+- After the tail fix, the dominant bottleneck is now starvation/throughput rather than overlap. Batch=2 is currently the best tradeoff seen, but it is still far from smooth realtime.
 - Current pacing still uses chunk-count startup gating, which is suspicious because chunk duration varies dramatically when decode windows grow.
 
 ## Current Hypotheses
 1. The biggest remaining gain is now in pacing and decode granularity, not correctness: we need more buffered-audio-aware scheduling and/or smaller/faster chunk production.
 2. Millisecond-based pacing should reduce startup latency and may smooth delivery better than chunk-count startup gating.
-3. If pacing alone is not enough, tuning `stream_batch_frames` / `stream_context_frames` should attack starvation directly before any larger architectural changes.
+3. Reducing or reshaping context retention may improve throughput further now that true tail emission is working.
