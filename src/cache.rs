@@ -75,9 +75,12 @@ impl GenerationCache {
             let layer_type = match layer_type_str.as_str() {
                 "conv" => LayerType::Conv,
                 "full_attention" => LayerType::FullAttention,
-                _ => return Err(LFM2Error::Cache(format!(
-                    "Unknown layer type: {}", layer_type_str
-                ))),
+                _ => {
+                    return Err(LFM2Error::Cache(format!(
+                        "Unknown layer type: {}",
+                        layer_type_str
+                    )))
+                }
             };
 
             match layer_type {
@@ -113,10 +116,14 @@ impl GenerationCache {
             kv_caches,
             conv_caches,
             seq_len: 0,
-            layer_types: config.layer_types.iter().map(|s| match s.as_str() {
-                "conv" => LayerType::Conv,
-                _ => LayerType::FullAttention,
-            }).collect(),
+            layer_types: config
+                .layer_types
+                .iter()
+                .map(|s| match s.as_str() {
+                    "conv" => LayerType::Conv,
+                    _ => LayerType::FullAttention,
+                })
+                .collect(),
             config: cache_config,
         })
     }
@@ -167,7 +174,8 @@ impl GenerationCache {
                     let array = view.to_owned();
                     if array.ndim() == 3 {
                         if let Some(cache) = self.conv_caches.get_mut(&layer_idx) {
-                            cache.state = array.into_dimensionality()
+                            cache.state = array
+                                .into_dimensionality()
                                 .map_err(|e| LFM2Error::Cache(format!("Shape error: {:?}", e)))?;
                         }
                     }
@@ -185,7 +193,8 @@ impl GenerationCache {
                     let array = view.to_owned();
                     if array.ndim() == 4 {
                         if let Some(cache) = self.kv_caches.get_mut(&layer_idx) {
-                            cache.key = array.into_dimensionality()
+                            cache.key = array
+                                .into_dimensionality()
                                 .map_err(|e| LFM2Error::Cache(format!("Shape error: {:?}", e)))?;
                         }
                     }
@@ -197,7 +206,8 @@ impl GenerationCache {
                     let array = view.to_owned();
                     if array.ndim() == 4 {
                         if let Some(cache) = self.kv_caches.get_mut(&layer_idx) {
-                            cache.value = array.into_dimensionality()
+                            cache.value = array
+                                .into_dimensionality()
                                 .map_err(|e| LFM2Error::Cache(format!("Shape error: {:?}", e)))?;
                         }
                     }
@@ -232,10 +242,14 @@ impl GenerationCache {
             num_key_value_heads: self.config.num_key_value_heads,
             num_hidden_layers: self.config.num_layers,
             conv_l_cache: self.config.conv_cache_len,
-            layer_types: self.layer_types.iter().map(|lt| match lt {
-                LayerType::Conv => "conv".to_string(),
-                LayerType::FullAttention => "full_attention".to_string(),
-            }).collect(),
+            layer_types: self
+                .layer_types
+                .iter()
+                .map(|lt| match lt {
+                    LayerType::Conv => "conv".to_string(),
+                    LayerType::FullAttention => "full_attention".to_string(),
+                })
+                .collect(),
             // Default values for fields we don't track
             name_or_path: "".to_string(),
             architectures: vec![],

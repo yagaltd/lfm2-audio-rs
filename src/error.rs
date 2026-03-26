@@ -6,37 +6,37 @@ use thiserror::Error;
 pub enum LFM2Error {
     #[error("ONNX error: {0}")]
     Onnx(#[from] ort::Error),
-    
+
     #[error("Model not found: {0}")]
     ModelNotFound(String),
-    
+
     #[error("Invalid configuration: {0}")]
     Config(String),
-    
+
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
-    
+
     #[error("Audio processing error: {0}")]
     Audio(String),
-    
+
     #[error("Generation error: {0}")]
     Generation(String),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    
+
     #[error("NDArray error: {0}")]
     Ndarray(#[from] ndarray::ShapeError),
-    
+
     #[error("Invalid audio format: {0}")]
     InvalidAudioFormat(String),
-    
+
     #[error("Cache error: {0}")]
     Cache(String),
-    
+
     #[error("Embedding error: {0}")]
     Embedding(String),
 }

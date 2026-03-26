@@ -151,11 +151,6 @@ button {
   transition: transform 140ms ease, opacity 140ms ease, background 140ms ease;
 }
 
-button.secondary {
-  background: rgba(29, 26, 23, 0.08);
-  color: var(--ink);
-}
-
 button:hover:not(:disabled) {
   transform: translateY(-1px);
 }
@@ -253,6 +248,25 @@ pre.feed {
 audio {
   width: 100%;
   margin-bottom: 16px;
+}
+
+.section-divider {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 28px 0 8px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 12px;
+}
+
+.section-divider::before,
+.section-divider::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: var(--line);
 }
 
 @media (max-width: 840px) {

@@ -11,8 +11,8 @@
     <section class="panel hero">
       <div>
         <p class="eyebrow">LFM2 Audio</p>
-        <h1>Browser mic demo for ASR and interleaved audio replies</h1>
-        <p class="lede">The browser handles VAD and mic capture. The Rust server keeps the ONNX Runtime model resident and serves sequential ASR/TTS over HTTP plus interleaved chat over WebSocket.</p>
+        <h1>Interleaved speech-to-speech on top, sequential tools below</h1>
+        <p class="lede">The browser handles VAD and mic capture. The Rust server keeps the ONNX Runtime model resident and serves interleaved chat over WebSocket plus sequential ASR and TTS over HTTP.</p>
       </div>
       <div class="grid two">
         <label>
@@ -24,9 +24,8 @@
           <div class="row">
             <input id="textInput" type="text" placeholder="Type a message for the assistant">
             <button id="sendText">Chat</button>
-            <button id="synthesizeText" class="secondary">Synthesize</button>
           </div>
-          <p class="hint">`Chat` uses the interleaved websocket session. `Synthesize` uses the sequential TTS HTTP route.</p>
+          <p class="hint">This stays in the interleaved websocket session.</p>
         </label>
       </div>
     </section>
@@ -87,22 +86,26 @@
 
     <section class="grid two">
       <div class="panel">
-        <h2>Transcript</h2>
+        <h2>Interleaved transcript</h2>
         <div class="feed" id="feed"></div>
       </div>
       <div class="panel">
-        <h2>Assistant audio</h2>
+        <h2>Interleaved assistant audio</h2>
         <audio id="assistantAudio" controls></audio>
         <pre class="log" id="log"></pre>
       </div>
     </section>
 
+    <div class="section-divider">
+      <span>Sequential mode</span>
+    </div>
+
     <section class="grid two">
       <div class="panel">
         <h2>Sequential ASR</h2>
         <label>
-          <span>WAV file</span>
-          <input id="asrFile" type="file" accept=".wav,audio/wav,audio/x-wav">
+          <span>Audio file</span>
+          <input id="asrFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac">
         </label>
         <label>
           <span>Optional ASR system prompt</span>
@@ -111,20 +114,37 @@
         <div class="row wrap">
           <button id="transcribeFile">Transcribe File</button>
         </div>
+        <p class="hint">The browser converts the selected file to mono 16 kHz WAV before sending it to the ASR route.</p>
         <pre class="feed" id="asrResult"></pre>
       </div>
 
       <div class="panel">
         <h2>Sequential TTS</h2>
         <label>
-          <span>Voice / system prompt</span>
-          <input id="ttsVoicePrompt" type="text" placeholder="Use the UK female voice.">
+          <span>Text to synthesize</span>
+          <textarea id="ttsText" rows="6" placeholder="Type text for sequential TTS"></textarea>
+        </label>
+        <label>
+          <span>Voice</span>
+          <select id="ttsVoiceSelect">
+            <option value="uk_female">UK female</option>
+            <option value="uk_male">UK male</option>
+            <option value="us_female">US female</option>
+            <option value="us_male">US male</option>
+          </select>
+        </label>
+        <label class="toggle compact">
+          <span class="label-with-value">
+            <span>Realtime streaming</span>
+            <input id="ttsRealtimeToggle" type="checkbox">
+          </span>
+          <span class="hint">Off keeps the existing one-shot WAV response. On opens a dedicated TTS websocket and plays chunks as they arrive.</span>
         </label>
         <div class="row wrap">
-          <button id="synthesizePanelText">Synthesize Typed Text</button>
+          <button id="synthesizePanelText">Synthesize</button>
         </div>
         <audio id="ttsAudio" controls></audio>
-        <p class="hint">This uses `/api/tts` and does not depend on the interleaved websocket session.</p>
+        <p class="hint">Sequential TTS stays separate from the interleaved websocket session.</p>
       </div>
     </section>
 

@@ -11,8 +11,8 @@ use crate::config::{Device, ModelConfig, Precision, PreprocessorConfig};
 use crate::embeddings::{AudioEmbedding, EmbedTokens};
 use crate::error::{LFM2Error, Result};
 use crate::sessions::{LFM2Sessions, SessionLoader};
-use crate::tokenizer::CODEBOOK_VOCAB;
 use crate::tokenizer::LFM2Tokenizer;
+use crate::tokenizer::CODEBOOK_VOCAB;
 
 /// Main LFM2Audio model
 pub struct LFM2Audio {
@@ -35,7 +35,7 @@ impl LFM2Audio {
     pub fn sessions(&self) -> &LFM2Sessions {
         &self.sessions
     }
-    
+
     /// Load model from directory
     pub fn from_pretrained<P: AsRef<Path>>(
         model_dir: P,
@@ -47,22 +47,34 @@ impl LFM2Audio {
 
         // Load configuration
         let config = ModelConfig::from_file(model_dir.join("config.json"))?;
-        log::info!("Loaded config: {} layers, {} codebooks", 
-            config.lfm.num_hidden_layers, config.codebooks);
+        log::info!(
+            "Loaded config: {} layers, {} codebooks",
+            config.lfm.num_hidden_layers,
+            config.codebooks
+        );
 
         // Load tokenizer
         let tokenizer = LFM2Tokenizer::from_dir(model_dir)?;
-        log::info!("Loaded tokenizer with vocab size {}", tokenizer.vocab_size());
+        log::info!(
+            "Loaded tokenizer with vocab size {}",
+            tokenizer.vocab_size()
+        );
 
         // Load embeddings
         let embed_tokens = EmbedTokens::from_dir(model_dir.join("onnx"))?;
-        log::info!("Loaded text embeddings: {} x {}", 
-            embed_tokens.vocab_size(), embed_tokens.hidden_size());
+        log::info!(
+            "Loaded text embeddings: {} x {}",
+            embed_tokens.vocab_size(),
+            embed_tokens.hidden_size()
+        );
 
         let audio_embedding = AudioEmbedding::from_dir(model_dir.join("onnx")).ok();
         if let Some(ref ae) = audio_embedding {
-            log::info!("Loaded audio embeddings: {} codebooks x {} vocab",
-                ae.codebooks(), ae.codebook_vocab());
+            log::info!(
+                "Loaded audio embeddings: {} codebooks x {} vocab",
+                ae.codebooks(),
+                ae.codebook_vocab()
+            );
         }
 
         // Load ONNX sessions
@@ -100,7 +112,8 @@ impl LFM2Audio {
             // Use ONNX session
             let input = ndarray::Array2::from_shape_vec(
                 (1, 8),
-                codes.iter()
+                codes
+                    .iter()
                     .enumerate()
                     .map(|(idx, &c)| (idx * CODEBOOK_VOCAB + c as usize) as i64)
                     .collect(),
@@ -115,7 +128,8 @@ impl LFM2Audio {
             })?;
 
             // Extract and average across codebooks if needed
-            let output = outputs.get("audio_embeds")
+            let output = outputs
+                .get("audio_embeds")
                 .ok_or_else(|| LFM2Error::Generation("audio_embeds not found".to_string()))?;
 
             let view = output.try_extract_array::<f32>()?;
@@ -137,7 +151,9 @@ impl LFM2Audio {
                 Ok(Array3::from_shape_vec((1, 1, flat.len()), flat)?)
             }
         } else {
-            Err(LFM2Error::Embedding("No audio embedding available".to_string()))
+            Err(LFM2Error::Embedding(
+                "No audio embedding available".to_string(),
+            ))
         }
     }
 
@@ -155,7 +171,8 @@ impl LFM2Audio {
             // Concatenate along sequence dimension
             let seq_len = all_embs.len();
             let hidden_size = all_embs[0].shape()[2];
-            let flat: Vec<f32> = all_embs.into_iter()
+            let flat: Vec<f32> = all_embs
+                .into_iter()
                 .flat_map(|a| {
                     let (raw, _offset) = a.into_raw_vec_and_offset();
                     raw
@@ -187,7 +204,8 @@ impl LFM2Audio {
             "mel_lengths" => t_lengths,
         })?;
 
-        let audio_embeds = outputs.get("audio_embeddings")
+        let audio_embeds = outputs
+            .get("audio_embeddings")
             .ok_or_else(|| LFM2Error::Generation("audio_embeddings not found".to_string()))?;
 
         let view = audio_embeds.try_extract_array::<f32>()?;
@@ -201,7 +219,10 @@ impl LFM2Audio {
         }
 
         let flat: Vec<f32> = view.iter().copied().collect();
-        Ok(Array3::from_shape_vec((shape[0], shape[1], shape[2]), flat)?)
+        Ok(Array3::from_shape_vec(
+            (shape[0], shape[1], shape[2]),
+            flat,
+        )?)
     }
 
     /// Initialize a new generation cache

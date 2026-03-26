@@ -5,6 +5,18 @@ const FRAME_MS = 80;
 const DEFAULT_TIMEOUT_MS = Number(process.env.BENCH_TIMEOUT_MS || 90_000);
 const WS_URL = process.env.BENCH_WS_URL || 'ws://127.0.0.1:18080/ws/interleaved';
 const SYSTEM_PROMPT = 'Respond with interleaved text and audio.';
+const ASSERT_PROFILE = process.env.BENCH_ASSERT_PROFILE || '';
+
+const ASSERT_PROFILES = {
+  dedicated_worker: {
+    first_playable_audio_ms: 1_200,
+    max_chunk_deficit_ms: 1_200,
+    holdout_first_playable_audio_ms: 1_200,
+    holdout_max_chunk_deficit_ms: 1_200,
+    server_first_decode_ms: 300,
+    server_first_detokenizer_wait_ms: 300,
+  },
+};
 
 const TUNE_PROMPTS = [
   'Say hello in one short sentence and speak it.',
@@ -139,6 +151,7 @@ async function runTurn(prompt, suite, index) {
             realtime_penalty_ms: realtimePenaltyMs,
             server_first_frame_ms: firstMeta?.frame_elapsed_ms ?? 0,
             server_first_decode_ms: firstMeta?.decode_elapsed_ms ?? 0,
+            server_first_detokenizer_wait_ms: firstMeta?.detokenizer_wait_ms ?? 0,
             server_first_queue_wait_ms: firstMeta?.queue_wait_ms ?? 0,
           });
         }
@@ -201,8 +214,34 @@ function aggregate(results) {
     chunk_count: median(results.map((r) => r.chunk_count)),
     server_first_frame_ms: median(results.map((r) => r.server_first_frame_ms)),
     server_first_decode_ms: median(results.map((r) => r.server_first_decode_ms)),
+    server_first_detokenizer_wait_ms: median(results.map((r) => r.server_first_detokenizer_wait_ms)),
     server_first_queue_wait_ms: median(results.map((r) => r.server_first_queue_wait_ms)),
   };
+}
+
+function assertProfile(profileName, tuneAgg, holdoutAgg) {
+  if (!profileName) return;
+  const profile = ASSERT_PROFILES[profileName];
+  if (!profile) {
+    throw new Error(`unknown BENCH_ASSERT_PROFILE=${profileName}`);
+  }
+
+  const checks = [
+    ['overlap_ms', tuneAgg.overlap_ms, 0],
+    ['holdout_overlap_ms', holdoutAgg.overlap_ms, 0],
+    ['first_playable_audio_ms', tuneAgg.first_playable_audio_ms, profile.first_playable_audio_ms],
+    ['max_chunk_deficit_ms', tuneAgg.max_chunk_deficit_ms, profile.max_chunk_deficit_ms],
+    ['holdout_first_playable_audio_ms', holdoutAgg.first_playable_audio_ms, profile.holdout_first_playable_audio_ms],
+    ['holdout_max_chunk_deficit_ms', holdoutAgg.max_chunk_deficit_ms, profile.holdout_max_chunk_deficit_ms],
+    ['server_first_decode_ms', tuneAgg.server_first_decode_ms, profile.server_first_decode_ms],
+    ['server_first_detokenizer_wait_ms', tuneAgg.server_first_detokenizer_wait_ms, profile.server_first_detokenizer_wait_ms],
+  ];
+
+  for (const [name, actual, limit] of checks) {
+    if (actual > limit) {
+      throw new Error(`${name}=${actual} exceeded limit ${limit} for profile ${profileName}`);
+    }
+  }
 }
 
 const tune = await runSuite(TUNE_PROMPTS, 'tune');
@@ -223,8 +262,10 @@ console.log(`METRIC total_turn_ms=${tuneAgg.total_turn_ms}`);
 console.log(`METRIC chunk_count=${tuneAgg.chunk_count}`);
 console.log(`METRIC server_first_frame_ms=${tuneAgg.server_first_frame_ms}`);
 console.log(`METRIC server_first_decode_ms=${tuneAgg.server_first_decode_ms}`);
+console.log(`METRIC server_first_detokenizer_wait_ms=${tuneAgg.server_first_detokenizer_wait_ms}`);
 console.log(`METRIC server_first_queue_wait_ms=${tuneAgg.server_first_queue_wait_ms}`);
 console.log(`METRIC holdout_realtime_penalty_ms=${holdoutAgg.realtime_penalty_ms}`);
 console.log(`METRIC holdout_first_playable_audio_ms=${holdoutAgg.first_playable_audio_ms}`);
 console.log(`METRIC holdout_overlap_ms=${holdoutAgg.overlap_ms}`);
 console.log(`METRIC holdout_max_chunk_deficit_ms=${holdoutAgg.max_chunk_deficit_ms}`);
+assertProfile(ASSERT_PROFILE, tuneAgg, holdoutAgg);

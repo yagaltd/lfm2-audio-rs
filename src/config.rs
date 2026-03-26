@@ -221,7 +221,7 @@ impl Precision {
             Precision::Q8 => "_q8",
         }
     }
-    
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Precision::FP32 => "fp32",
@@ -234,7 +234,7 @@ impl Precision {
 
 impl std::str::FromStr for Precision {
     type Err = String;
-    
+
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "fp32" => Ok(Precision::FP32),
@@ -260,9 +260,9 @@ impl Device {
     #[allow(deprecated)]
     pub fn execution_providers(&self) -> Vec<ort::execution_providers::ExecutionProviderDispatch> {
         use ort::execution_providers::*;
-        
+
         let mut eps = Vec::new();
-        
+
         match self {
             Device::CPU => {
                 // CPU is always available as fallback
@@ -284,10 +284,10 @@ impl Device {
                 eps.push(TensorRTExecutionProvider::default().build());
             }
         }
-        
+
         // Always add CPU as fallback
         eps.push(CPUExecutionProvider::default().build());
-        
+
         eps
     }
 }

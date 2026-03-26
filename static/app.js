@@ -17,7 +17,6 @@ const resetSessionButton = document.getElementById("resetSession");
 const startMicButton = document.getElementById("startMic");
 const stopMicButton = document.getElementById("stopMic");
 const sendTextButton = document.getElementById("sendText");
-const synthesizeTextButton = document.getElementById("synthesizeText");
 const synthesizePanelTextButton = document.getElementById("synthesizePanelText");
 const textInput = document.getElementById("textInput");
 const systemPromptInput = document.getElementById("systemPrompt");
@@ -25,7 +24,9 @@ const asrFileInput = document.getElementById("asrFile");
 const asrPromptInput = document.getElementById("asrPrompt");
 const transcribeFileButton = document.getElementById("transcribeFile");
 const asrResult = document.getElementById("asrResult");
-const ttsVoicePromptInput = document.getElementById("ttsVoicePrompt");
+const ttsTextInput = document.getElementById("ttsText");
+const ttsVoiceSelect = document.getElementById("ttsVoiceSelect");
+const ttsRealtimeToggle = document.getElementById("ttsRealtimeToggle");
 const vadThresholdInput = document.getElementById("vadThreshold");
 const vadThresholdValue = document.getElementById("vadThresholdValue");
 const silenceTimeoutInput = document.getElementById("silenceTimeout");
@@ -46,6 +47,8 @@ let sourceNode = null;
 let workletNode = null;
 let assistantPlaybackContext = null;
 let assistantPlaybackNode = null;
+let ttsPlaybackContext = null;
+let ttsPlaybackNode = null;
 let vadModule = null;
 let vadHandle = null;
 let vadHandlePtr = null;
@@ -62,6 +65,11 @@ let currentAssistantItem = null;
 let pendingAssistantChunkMeta = null;
 let assistantStreamMetrics = null;
 let lastAssistantChunkIndex = null;
+let ttsPcmChunks = [];
+let ttsPendingChunkMeta = null;
+let ttsLastChunkIndex = null;
+let ttsStreamingAudio = false;
+let ttsSocket = null;
 
 function log(message) {
   const time = new Date().toLocaleTimeString();
@@ -174,6 +182,55 @@ function setAudioElementSource(audioEl, blob) {
   audioEl.src = nextUrl;
 }
 
+function float32ToInt16(samples) {
+  const pcm = new Int16Array(samples.length);
+  for (let idx = 0; idx < samples.length; idx += 1) {
+    const clamped = Math.max(-1, Math.min(1, samples[idx]));
+    pcm[idx] = clamped < 0 ? Math.round(clamped * 32768) : Math.round(clamped * 32767);
+  }
+  return pcm;
+}
+
+async function resampleMonoAudio(samples, sourceSampleRate, targetSampleRate) {
+  if (sourceSampleRate === targetSampleRate) {
+    return samples;
+  }
+
+  const frameCount = Math.max(
+    1,
+    Math.round(samples.length * (targetSampleRate / sourceSampleRate)),
+  );
+  const offlineContext = new OfflineAudioContext(1, frameCount, targetSampleRate);
+  const buffer = offlineContext.createBuffer(1, samples.length, sourceSampleRate);
+  buffer.copyToChannel(samples, 0);
+  const source = offlineContext.createBufferSource();
+  source.buffer = buffer;
+  source.connect(offlineContext.destination);
+  source.start();
+  const rendered = await offlineContext.startRendering();
+  return rendered.getChannelData(0).slice();
+}
+
+async function convertAudioFileToWavBlob(file, targetSampleRate = SAMPLE_RATE) {
+  const arrayBuffer = await file.arrayBuffer();
+  const context = new AudioContext();
+  try {
+    const decoded = await context.decodeAudioData(arrayBuffer.slice(0));
+    const mono = new Float32Array(decoded.length);
+    const channels = decoded.numberOfChannels;
+    for (let channel = 0; channel < channels; channel += 1) {
+      const data = decoded.getChannelData(channel);
+      for (let idx = 0; idx < decoded.length; idx += 1) {
+        mono[idx] += data[idx] / channels;
+      }
+    }
+    const resampled = await resampleMonoAudio(mono, decoded.sampleRate, targetSampleRate);
+    return createWavBlobFromInt16(float32ToInt16(resampled), targetSampleRate);
+  } finally {
+    await context.close();
+  }
+}
+
 async function ensureAssistantPlayback() {
   if (assistantPlaybackNode && assistantPlaybackContext) {
     return;
@@ -240,6 +297,71 @@ async function enqueueAssistantChunk(buffer) {
     floatChunk[idx] = pcm[idx] / 32768;
   }
   assistantPlaybackNode.port.postMessage(
+    { type: "enqueue", samples: floatChunk },
+    [floatChunk.buffer],
+  );
+}
+
+async function ensureTtsPlayback() {
+  if (ttsPlaybackNode && ttsPlaybackContext) {
+    return;
+  }
+
+  ttsPlaybackContext = new AudioContext({ sampleRate: ASSISTANT_SAMPLE_RATE });
+  await ttsPlaybackContext.audioWorklet.addModule(
+    `/static/assistant-player-worklet.js?v=${STATIC_ASSET_VERSION}`,
+  );
+  ttsPlaybackNode = new AudioWorkletNode(
+    ttsPlaybackContext,
+    "assistant-player-worklet",
+  );
+  ttsPlaybackNode.port.onmessage = (event) => {
+    if (event.data?.type !== "buffer-state") {
+      return;
+    }
+
+    if (event.data.reason === "playback-started") {
+      log(`Realtime TTS playback started (${samplesToMs(event.data.queued_samples)}ms queued)`);
+      return;
+    }
+
+    if (event.data.reason === "playback-resumed") {
+      log(
+        `Realtime TTS playback resumed (${samplesToMs(event.data.queued_samples)}ms queued, underruns=${event.data.underruns})`,
+      );
+      return;
+    }
+
+    if (event.data.reason === "underrun") {
+      log(
+        `Realtime TTS playback underrun (#${event.data.underruns}, ${samplesToMs(event.data.queued_samples)}ms queued)`,
+      );
+    }
+  };
+  ttsPlaybackNode.connect(ttsPlaybackContext.destination);
+}
+
+function resetTtsStream() {
+  ttsPcmChunks = [];
+  ttsPendingChunkMeta = null;
+  ttsLastChunkIndex = null;
+  ttsStreamingAudio = true;
+  ttsPlaybackNode?.port.postMessage({ type: "reset" });
+}
+
+async function enqueueTtsChunk(buffer) {
+  await ensureTtsPlayback();
+  if (ttsPlaybackContext.state === "suspended") {
+    await ttsPlaybackContext.resume();
+  }
+
+  const pcm = new Int16Array(buffer);
+  ttsPcmChunks.push(new Int16Array(pcm));
+  const floatChunk = new Float32Array(pcm.length);
+  for (let idx = 0; idx < pcm.length; idx += 1) {
+    floatChunk[idx] = pcm[idx] / 32768;
+  }
+  ttsPlaybackNode.port.postMessage(
     { type: "enqueue", samples: floatChunk },
     [floatChunk.buffer],
   );
@@ -654,27 +776,33 @@ function sendTextTurn() {
   setPhase("Processing");
 }
 
+function closeTtsSocket() {
+  if (ttsSocket) {
+    ttsSocket.close();
+    ttsSocket = null;
+  }
+}
+
 async function transcribeSelectedFile() {
   const file = asrFileInput.files?.[0];
   if (!file) {
-    log("Choose a WAV file first");
+    log("Choose an audio file first");
     return;
   }
 
   transcribeFileButton.disabled = true;
   asrResult.textContent = "Transcribing...";
   try {
+    const wavBlob = await convertAudioFileToWavBlob(file);
     const headers = {};
     if (asrPromptInput.value.trim()) {
       headers["x-system-prompt"] = asrPromptInput.value.trim();
     }
-    if (file.type) {
-      headers["Content-Type"] = file.type;
-    }
+    headers["Content-Type"] = "audio/wav";
     const response = await fetch("/api/asr", {
       method: "POST",
       headers,
-      body: file,
+      body: wavBlob,
     });
     if (!response.ok) {
       throw new Error(await response.text());
@@ -691,36 +819,130 @@ async function transcribeSelectedFile() {
   }
 }
 
+async function synthesizeRealtimeText(text) {
+  return new Promise((resolve, reject) => {
+    closeTtsSocket();
+    resetTtsStream();
+
+    const protocol = location.protocol === "https:" ? "wss" : "ws";
+    const socket = new WebSocket(`${protocol}://${location.host}/ws/tts`);
+    socket.binaryType = "arraybuffer";
+    ttsSocket = socket;
+
+    socket.addEventListener("open", () => {
+      log("Realtime TTS socket connected");
+      socket.send(JSON.stringify({
+        type: "tts.request",
+        text,
+        voice: ttsVoiceSelect.value || undefined,
+      }));
+    });
+
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data === "string") {
+        const message = JSON.parse(event.data);
+        switch (message.type) {
+          case "status":
+            log(`Realtime TTS phase: ${message.phase}`);
+            break;
+          case "assistant.text.delta":
+            break;
+          case "assistant.text.done":
+            break;
+          case "assistant.audio.start":
+            resetTtsStream();
+            break;
+          case "assistant.audio.chunk":
+            ttsPendingChunkMeta = message;
+            break;
+          case "assistant.audio.end": {
+            if (ttsStreamingAudio && ttsPcmChunks.length > 0) {
+              const pcm = binaryToInt16Array(ttsPcmChunks.map((chunk) => chunk.buffer));
+              const blob = createWavBlobFromInt16(pcm, ASSISTANT_SAMPLE_RATE);
+              setAudioElementSource(ttsAudio, blob);
+              log(`Realtime TTS complete (${blob.size} bytes)`);
+            }
+            ttsStreamingAudio = false;
+            resolve();
+            closeTtsSocket();
+            break;
+          }
+          case "error":
+            reject(new Error(message.message));
+            closeTtsSocket();
+            break;
+          default:
+            break;
+        }
+        return;
+      }
+
+      const chunkDecision = acceptAssistantAudioChunk(
+        ttsLastChunkIndex,
+        ttsPendingChunkMeta,
+      );
+      if (!chunkDecision.accept) {
+        const rejectedChunkIndex = ttsPendingChunkMeta?.chunk_index ?? "n/a";
+        log(
+          `Dropped realtime TTS audio chunk (${chunkDecision.reason}, chunk=${rejectedChunkIndex}, last=${ttsLastChunkIndex ?? "n/a"})`,
+        );
+        ttsPendingChunkMeta = null;
+        return;
+      }
+
+      ttsLastChunkIndex = chunkDecision.nextChunkIndex;
+      enqueueTtsChunk(event.data).catch((error) => {
+        reject(error);
+        closeTtsSocket();
+      });
+      ttsPendingChunkMeta = null;
+    });
+
+    socket.addEventListener("close", () => {
+      if (ttsSocket === socket) {
+        ttsSocket = null;
+      }
+    });
+
+    socket.addEventListener("error", () => {
+      reject(new Error("Realtime TTS websocket error"));
+      closeTtsSocket();
+    });
+  });
+}
+
 async function synthesizeTypedText() {
-  const text = textInput.value.trim();
+  const text = ttsTextInput.value.trim();
   if (!text) {
     log("Type some text to synthesize first");
     return;
   }
 
-  synthesizeTextButton.disabled = true;
   synthesizePanelTextButton.disabled = true;
   try {
-    const response = await fetch("/api/tts", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        text,
-        voice: ttsVoicePromptInput.value.trim() || undefined,
-      }),
-    });
-    if (!response.ok) {
-      throw new Error(await response.text());
+    if (ttsRealtimeToggle.checked) {
+      await synthesizeRealtimeText(text);
+    } else {
+      const response = await fetch("/api/tts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          text,
+          voice: ttsVoiceSelect.value || undefined,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const blob = await response.blob();
+      setAudioElementSource(ttsAudio, blob);
+      log(`TTS complete (${blob.size} bytes)`);
     }
-    const blob = await response.blob();
-    setAudioElementSource(ttsAudio, blob);
-    log(`TTS complete (${blob.size} bytes)`);
   } catch (error) {
     log(`TTS failed: ${error.message}`);
   } finally {
-    synthesizeTextButton.disabled = false;
     synthesizePanelTextButton.disabled = false;
   }
 }
@@ -746,11 +968,6 @@ startMicButton.addEventListener("click", async () => {
 });
 stopMicButton.addEventListener("click", stopMic);
 sendTextButton.addEventListener("click", sendTextTurn);
-synthesizeTextButton.addEventListener("click", () => {
-  synthesizeTypedText().catch((error) => {
-    log(`TTS failed: ${error.message}`);
-  });
-});
 synthesizePanelTextButton.addEventListener("click", () => {
   synthesizeTypedText().catch((error) => {
     log(`TTS failed: ${error.message}`);

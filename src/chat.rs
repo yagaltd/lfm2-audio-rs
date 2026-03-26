@@ -98,10 +98,7 @@ impl<'a> ChatSession<'a> {
         &mut self,
         mut on_event: Option<&mut dyn FnMut(InterleavedEvent) -> Result<()>>,
     ) -> Result<AssistantResponse> {
-        log::info!(
-            "Chat: Generating response for {} turns",
-            self.turns.len()
-        );
+        log::info!("Chat: Generating response for {} turns", self.turns.len());
 
         let include_system_prompt = self.cache_seq_len == 0;
         let interleaved = self.model.interleaved();

@@ -3,8 +3,8 @@
 
 use ort::session::builder::GraphOptimizationLevel;
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::config::{Device, Precision};
 use crate::error::{LFM2Error, Result};
@@ -79,6 +79,15 @@ impl SessionLoader {
 
     /// Load a single model with external data support
     fn load_model(&self, onnx_dir: &Path, name: &str) -> Result<ort::session::Session> {
+        self.load_model_with_threads(onnx_dir, name, 8)
+    }
+
+    fn load_model_with_threads(
+        &self,
+        onnx_dir: &Path,
+        name: &str,
+        intra_threads: usize,
+    ) -> Result<ort::session::Session> {
         let suffix = self.precision.suffix();
         let file_name = format!("{}{}.onnx", name, suffix);
         let model_path = onnx_dir.join(&file_name);
@@ -92,8 +101,8 @@ impl SessionLoader {
         }
 
         // Build session
-        let mut builder = ort::session::Session::builder()
-            .map_err(|e| LFM2Error::Onnx(e.into()))?;
+        let mut builder =
+            ort::session::Session::builder().map_err(|e| LFM2Error::Onnx(e.into()))?;
 
         // Set optimization level and memory pattern
         builder = builder
@@ -101,7 +110,7 @@ impl SessionLoader {
             .map_err(|e| LFM2Error::Onnx(e.into()))?
             .with_memory_pattern(true)
             .map_err(|e| LFM2Error::Onnx(e.into()))?
-            .with_intra_threads(8)
+            .with_intra_threads(intra_threads)
             .map_err(|e| LFM2Error::Onnx(e.into()))?;
 
         // Set execution providers
@@ -135,8 +144,8 @@ impl SessionLoader {
             )));
         }
 
-        let mut builder = ort::session::Session::builder()
-            .map_err(|e| LFM2Error::Onnx(e.into()))?;
+        let mut builder =
+            ort::session::Session::builder().map_err(|e| LFM2Error::Onnx(e.into()))?;
 
         builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -159,6 +168,28 @@ impl SessionLoader {
 
         Ok(session)
     }
+}
+
+pub fn load_audio_detokenizer_session<P: AsRef<Path>>(
+    model_dir: P,
+    precision: Precision,
+    device: Device,
+) -> Result<ort::session::Session> {
+    load_audio_detokenizer_session_with_threads(model_dir, precision, device, 8)
+}
+
+pub fn load_audio_detokenizer_session_with_threads<P: AsRef<Path>>(
+    model_dir: P,
+    precision: Precision,
+    device: Device,
+    intra_threads: usize,
+) -> Result<ort::session::Session> {
+    let model_dir = model_dir.as_ref().to_path_buf();
+    SessionLoader::new(&model_dir, precision, device).load_model_with_threads(
+        &model_dir.join("onnx"),
+        "audio_detokenizer",
+        intra_threads,
+    )
 }
 
 /// Model file paths for reference

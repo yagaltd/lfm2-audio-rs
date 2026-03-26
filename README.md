@@ -19,7 +19,7 @@ This repo is built around the ONNX export, not the original PyTorch checkpoints.
 ## Practical Guidance
 
 - Use `q4` unless you have a strong reason not to.
-- On CPU, sequential ASR and sequential TTS are the recommended paths.
+- On CPU, sequential ASR and sequential TTS are the recommended paths. TTS is not smooth.
 - Interleaved mode works, but CPU realtime speech-to-speech is still not smooth enough. It can sound choppy under load.
 - On GPU, interleaved mode is the path that makes the most sense to push further.
 

@@ -22,12 +22,16 @@ pub fn load_audio<P: AsRef<Path>>(path: P) -> Result<(Vec<f32>, WavSpec)> {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| crate::error::LFM2Error::Audio(format!("Failed to read float samples: {}", e)))?,
+            .map_err(|e| {
+                crate::error::LFM2Error::Audio(format!("Failed to read float samples: {}", e))
+            })?,
         hound::SampleFormat::Int => reader
             .samples::<i16>()
             .map(|s| s.map(|s| s as f32 / 32768.0))
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| crate::error::LFM2Error::Audio(format!("Failed to read int samples: {}", e)))?,
+            .map_err(|e| {
+                crate::error::LFM2Error::Audio(format!("Failed to read int samples: {}", e))
+            })?,
     };
 
     Ok((samples, spec))
@@ -63,12 +67,16 @@ pub fn decode_wav_bytes(bytes: &[u8]) -> Result<(Vec<f32>, WavSpec)> {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| crate::error::LFM2Error::Audio(format!("Failed to read float samples: {}", e)))?,
+            .map_err(|e| {
+                crate::error::LFM2Error::Audio(format!("Failed to read float samples: {}", e))
+            })?,
         hound::SampleFormat::Int => reader
             .samples::<i16>()
             .map(|s| s.map(|s| s as f32 / 32768.0))
             .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| crate::error::LFM2Error::Audio(format!("Failed to read int samples: {}", e)))?,
+            .map_err(|e| {
+                crate::error::LFM2Error::Audio(format!("Failed to read int samples: {}", e))
+            })?,
     };
 
     Ok((samples, spec))

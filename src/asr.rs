@@ -4,7 +4,7 @@
 
 use ndarray::Array2;
 
-use crate::audio::compute_mel_spectrogram;
+use crate::audio::{compute_mel_spectrogram, resample_linear};
 use crate::cache::GenerationCache;
 use crate::error::{LFM2Error, Result};
 use crate::model::LFM2Audio;
@@ -27,7 +27,7 @@ impl Default for ASROptions {
         Self {
             system_prompt: "Perform ASR.".to_string(),
             max_new_tokens: 256,
-            temperature: 1.0,
+            temperature: 0.0,
         }
     }
 }
@@ -44,10 +44,20 @@ impl<'a> ASRPipeline<'a> {
         sample_rate: u32,
         options: &ASROptions,
     ) -> Result<String> {
-        log::info!("ASR: Transcribing {} samples at {} Hz", audio.len(), sample_rate);
+        log::info!(
+            "ASR: Transcribing {} samples at {} Hz",
+            audio.len(),
+            sample_rate
+        );
+
+        let prepared_audio = prepare_audio(
+            audio,
+            sample_rate,
+            self.model.preprocessor_config.sample_rate,
+        );
 
         // 1. Compute mel spectrogram
-        let mel = compute_mel_spectrogram(audio, &self.model.preprocessor_config)?;
+        let mel = compute_mel_spectrogram(&prepared_audio, &self.model.preprocessor_config)?;
         log::debug!("Mel spectrogram shape: {:?}", mel.shape());
 
         // 2. Encode audio to embeddings
@@ -64,7 +74,11 @@ impl<'a> ASRPipeline<'a> {
         let prefix_ids = self.model.tokenizer.encode(&prefix_text, false);
         let suffix_ids = self.model.tokenizer.encode(suffix_text, false);
 
-        log::debug!("Prefix tokens: {}, Suffix tokens: {}", prefix_ids.len(), suffix_ids.len());
+        log::debug!(
+            "Prefix tokens: {}, Suffix tokens: {}",
+            prefix_ids.len(),
+            suffix_ids.len()
+        );
 
         // 4. Get text embeddings
         let prefix_embeds = self.model.get_text_embeddings(&prefix_ids);
@@ -81,8 +95,7 @@ impl<'a> ASRPipeline<'a> {
 
         // Copy prefix
         let prefix_flat: Vec<f32> = prefix_embeds.iter().copied().collect();
-        all_embeds[..prefix_len * hidden_size]
-            .copy_from_slice(&prefix_flat);
+        all_embeds[..prefix_len * hidden_size].copy_from_slice(&prefix_flat);
 
         // Copy audio embeddings
         let audio_flat: Vec<f32> = audio_embeds.iter().copied().collect();
@@ -91,13 +104,10 @@ impl<'a> ASRPipeline<'a> {
 
         // Copy suffix
         let suffix_flat: Vec<f32> = suffix_embeds.iter().copied().collect();
-        all_embeds[(prefix_len + audio_len) * hidden_size..]
-            .copy_from_slice(&suffix_flat);
+        all_embeds[(prefix_len + audio_len) * hidden_size..].copy_from_slice(&suffix_flat);
 
-        let input_embeds = ndarray::Array3::from_shape_vec(
-            (1, total_len, hidden_size),
-            all_embeds,
-        )?;
+        let input_embeds =
+            ndarray::Array3::from_shape_vec((1, total_len, hidden_size), all_embeds)?;
 
         // 6. Create attention mask (all ones)
         let attention_mask = Array2::<i64>::ones((1, total_len));
@@ -145,10 +155,13 @@ impl<'a> ASRPipeline<'a> {
             logits = self.run_decoder(&next_embeds, &next_mask, &mut cache)?;
         }
 
-
         // 11. Decode tokens to text
         let text = self.model.tokenizer.decode(&generated_tokens, true);
-        log::info!("ASR: Generated {} tokens -> {} chars", generated_tokens.len(), text.len());
+        log::info!(
+            "ASR: Generated {} tokens -> {} chars",
+            generated_tokens.len(),
+            text.len()
+        );
 
         Ok(text)
     }
@@ -160,24 +173,24 @@ impl<'a> ASRPipeline<'a> {
         cache: &mut GenerationCache,
     ) -> Result<ndarray::Array3<f32>> {
         use ort::value::Value;
-        
+
         // Ensure arrays are contiguous by cloning if necessary
         let inputs_contig = inputs_embeds.as_standard_layout().to_owned();
         let mask_contig = attention_mask.as_standard_layout().to_owned();
-        
+
         // Create values from owned arrays
         let t_inputs = Value::from_array(inputs_contig)?;
         let t_mask = Value::from_array(mask_contig)?;
 
         // Get cache inputs (now returns DynValue directly)
         let cache_inputs = cache.prepare_cache_inputs();
-        
+
         // Build input list: start with required inputs
         let mut inputs_list: Vec<(String, ort::value::DynValue)> = vec![
             ("inputs_embeds".to_string(), t_inputs.into_dyn()),
             ("attention_mask".to_string(), t_mask.into_dyn()),
         ];
-        
+
         // Add cache inputs (already DynValue)
         for (name, value) in cache_inputs {
             inputs_list.push((name, value));
@@ -188,7 +201,8 @@ impl<'a> ASRPipeline<'a> {
         let outputs = decoder.run(inputs_list)?;
 
         // Extract logits
-        let logits_output = outputs.get("logits")
+        let logits_output = outputs
+            .get("logits")
             .ok_or_else(|| LFM2Error::Generation("logits not found".to_string()))?;
 
         let view = logits_output.try_extract_array::<f32>()?;
@@ -202,15 +216,20 @@ impl<'a> ASRPipeline<'a> {
         }
 
         let flat: Vec<f32> = view.iter().copied().collect();
-        let logits = ndarray::Array3::from_shape_vec(
-            (shape[0], shape[1], shape[2]),
-            flat,
-        )?;
+        let logits = ndarray::Array3::from_shape_vec((shape[0], shape[1], shape[2]), flat)?;
 
         // Update cache from decoder outputs (present_* -> past_*)
         cache.update(&outputs)?;
-        
+
         Ok(logits)
+    }
+}
+
+fn prepare_audio(audio: &[f32], sample_rate: u32, target_sample_rate: u32) -> Vec<f32> {
+    if sample_rate == target_sample_rate {
+        audio.to_vec()
+    } else {
+        resample_linear(audio, sample_rate, target_sample_rate)
     }
 }
 
@@ -229,7 +248,8 @@ fn extract_last_logits(logits: &ndarray::Array3<f32>, vocab_size: usize) -> Resu
 
 /// Argmax sampling (greedy)
 fn argmax(logits: &[f32]) -> u32 {
-    logits.iter()
+    logits
+        .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(idx, _)| idx as u32)
@@ -243,19 +263,13 @@ fn sample_with_temperature(logits: &[f32], temperature: f32) -> u32 {
     }
 
     // Apply temperature
-    let scaled: Vec<f32> = logits.iter()
-        .map(|&x| x / temperature)
-        .collect();
+    let scaled: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
 
     // Softmax
     let max_logit = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exp_shifted: Vec<f32> = scaled.iter()
-        .map(|&x| (x - max_logit).exp())
-        .collect();
+    let exp_shifted: Vec<f32> = scaled.iter().map(|&x| (x - max_logit).exp()).collect();
     let sum_exp: f32 = exp_shifted.iter().sum();
-    let probs: Vec<f32> = exp_shifted.iter()
-        .map(|&x| x / sum_exp)
-        .collect();
+    let probs: Vec<f32> = exp_shifted.iter().map(|&x| x / sum_exp).collect();
 
     // Sample
     use rand::Rng;
@@ -271,4 +285,28 @@ fn sample_with_temperature(logits: &[f32], temperature: f32) -> u32 {
     }
 
     probs.len() as u32 - 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prepare_audio, ASROptions};
+
+    #[test]
+    fn asr_defaults_to_greedy_decoding() {
+        assert_eq!(ASROptions::default().temperature, 0.0);
+    }
+
+    #[test]
+    fn prepare_audio_resamples_when_sample_rate_differs() {
+        let audio = vec![0.0f32; 48_000];
+        let prepared = prepare_audio(&audio, 48_000, 16_000);
+        assert_eq!(prepared.len(), 16_000);
+    }
+
+    #[test]
+    fn prepare_audio_leaves_matching_sample_rate_unchanged() {
+        let audio = vec![0.1f32, -0.2, 0.3];
+        let prepared = prepare_audio(&audio, 16_000, 16_000);
+        assert_eq!(prepared, audio);
+    }
 }

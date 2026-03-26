@@ -5,7 +5,7 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        DefaultBodyLimit, State,
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware,
@@ -23,9 +23,8 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        mpsc as std_mpsc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        mpsc as std_mpsc, Arc,
     },
     time::{Duration, Instant},
 };
@@ -37,14 +36,14 @@ use tower_http::{
 use tracing::{info, warn};
 
 use lfm2_audio::{
-    decode_wav_bytes, encode_wav_bytes,
-    sessions::load_audio_detokenizer_session_with_threads, ASROptions, Device,
-    InterleavedOptions, LFM2Audio, Precision, TTSOptions,
+    decode_wav_bytes, encode_wav_bytes, sessions::load_audio_detokenizer_session_with_threads,
+    ASROptions, Device, InterleavedOptions, LFM2Audio, Precision, TTSOptions,
 };
 
 const DEFAULT_MODEL_DIR: &str = "/home/aurel/Documents/vibe/STT-rust/LFM2.5-Audio-1.5B-ONNX";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_SYSTEM_PROMPT_INTERLEAVED: &str = "Respond with interleaved text and audio.";
+const MAX_ASR_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_DECODE_BATCH_FRAMES: usize = 2;
@@ -334,10 +333,10 @@ impl ServerConfig {
                     );
                 }
                 "--interleaved-log" => {
-                    interleaved_log_path = Some(PathBuf::from(
-                        args.next()
-                            .ok_or_else(|| anyhow!("missing value for --interleaved-log"))?,
-                    ));
+                    interleaved_log_path =
+                        Some(PathBuf::from(args.next().ok_or_else(|| {
+                            anyhow!("missing value for --interleaved-log")
+                        })?));
                 }
                 other => return Err(anyhow!("unknown argument: {}", other)),
             }
@@ -352,10 +351,7 @@ impl ServerConfig {
             cpu_workers,
             interleaved_n_text,
             interleaved_n_audio,
-            stream_decode: StreamingDecodeConfig::new(
-                stream_batch_frames,
-                stream_context_frames,
-            ),
+            stream_decode: StreamingDecodeConfig::new(stream_batch_frames, stream_context_frames),
             interleaved_log_path,
         })
     }
@@ -502,6 +498,29 @@ struct TtsRequest {
     audio_top_k: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum TtsWsClientMessage {
+    #[serde(rename = "tts.request")]
+    TtsRequest {
+        text: String,
+        #[serde(default)]
+        voice: Option<String>,
+        #[serde(default)]
+        system_prompt: Option<String>,
+        #[serde(default)]
+        max_tokens: Option<usize>,
+        #[serde(default)]
+        text_temperature: Option<f32>,
+        #[serde(default)]
+        audio_temperature: Option<f32>,
+        #[serde(default)]
+        audio_top_k: Option<usize>,
+    },
+    #[serde(rename = "ping")]
+    Ping,
+}
+
 #[derive(Debug)]
 struct TtsResponse {
     wav_bytes: Vec<u8>,
@@ -640,6 +659,11 @@ enum ModelCommand {
         request: TtsRequest,
         reply: oneshot::Sender<ApiResult<TtsResponse>>,
     },
+    TtsStream {
+        request: TtsRequest,
+        stream: mpsc::Sender<AssistantStreamEvent>,
+        reply: oneshot::Sender<ApiResult<AssistantTurn>>,
+    },
     SessionStart {
         session_id: u64,
         system_prompt: String,
@@ -704,7 +728,10 @@ fn split_new_waveform_tail(
         return Ok((waveform, next_emitted_samples));
     }
 
-    Ok((waveform[last_emitted_samples..].to_vec(), next_emitted_samples))
+    Ok((
+        waveform[last_emitted_samples..].to_vec(),
+        next_emitted_samples,
+    ))
 }
 
 impl StreamingAudioDecoder {
@@ -879,10 +906,9 @@ impl StreamingAudioDecoder {
         &mut self,
         completion: DetokenizeCompletion,
     ) -> ApiResult<Option<DecodedAudioChunk>> {
-        let inflight = self
-            .inflight
-            .pop_front()
-            .ok_or_else(|| ApiError::internal("received detokenizer completion without in-flight request"))?;
+        let inflight = self.inflight.pop_front().ok_or_else(|| {
+            ApiError::internal("received detokenizer completion without in-flight request")
+        })?;
         if inflight.decode_index != completion.decode_index {
             return Err(ApiError::internal(format!(
                 "detokenizer completion out of order: expected {}, got {}",
@@ -1102,20 +1128,10 @@ async fn main() -> Result<()> {
                     LFM2Audio::from_pretrained(&model_path, precision, device)
                         .expect("failed to load worker model"),
                 ));
-                let detokenizer = spawn_detokenizer_worker(
-                    model_path.clone(),
-                    precision,
-                    device,
-                    worker_index,
-                )
-                .expect("failed to spawn dedicated detokenizer worker");
-                model_worker(
-                    model,
-                    rx,
-                    stream_decode,
-                    interleaved_overrides,
-                    detokenizer,
-                );
+                let detokenizer =
+                    spawn_detokenizer_worker(model_path.clone(), precision, device, worker_index)
+                        .expect("failed to spawn dedicated detokenizer worker");
+                model_worker(model, rx, stream_decode, interleaved_overrides, detokenizer);
             })
             .map_err(|err| anyhow!("failed to spawn worker thread: {}", err))?;
         workers.push(tx);
@@ -1147,10 +1163,17 @@ fn build_router(config: &ServerConfig, state: AppState) -> Router {
     let static_dir = config.static_dir.clone();
     Router::new()
         .route("/health", get(health_check))
-        .route("/api/asr", post(transcribe_raw))
+        .route(
+            "/api/asr",
+            post(transcribe_raw).layer(DefaultBodyLimit::max(MAX_ASR_UPLOAD_BYTES)),
+        )
         .route("/api/tts", post(synthesize))
+        .route("/ws/tts", get(tts_stream_socket))
         .route("/ws/interleaved", get(interleaved_socket))
-        .route("/v1/audio/transcriptions", post(transcribe_raw))
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcribe_raw).layer(DefaultBodyLimit::max(MAX_ASR_UPLOAD_BYTES)),
+        )
         .route("/v1/audio/speech", post(synthesize))
         .route_service("/", ServeFile::new(static_dir.join("index.html")))
         .nest_service("/static", ServeDir::new(static_dir))
@@ -1213,20 +1236,21 @@ fn spawn_detokenizer_worker(
                 device,
                 STREAM_DETOKENIZER_INTRA_THREADS,
             )
-                .expect("failed to load dedicated detokenizer session");
+            .expect("failed to load dedicated detokenizer session");
 
             while let Ok(request) = request_rx.recv() {
                 let detokenizer_wait_ms = request.submitted_at.elapsed().as_millis() as u64;
                 let decode_started_at = Instant::now();
-                let result = lfm2_audio::decode_audio_codes_standalone(&mut detokenizer, &request.codes)
-                    .map(|waveform| DetokenizeCompletion {
-                        decode_index: request.decode_index,
-                        waveform,
-                        decode_elapsed_ms: decode_started_at.elapsed().as_millis() as u64,
-                        detokenizer_wait_ms,
-                        backend: "onnx",
-                    })
-                    .map_err(|err| ApiError::internal(err.to_string()));
+                let result =
+                    lfm2_audio::decode_audio_codes_standalone(&mut detokenizer, &request.codes)
+                        .map(|waveform| DetokenizeCompletion {
+                            decode_index: request.decode_index,
+                            waveform,
+                            decode_elapsed_ms: decode_started_at.elapsed().as_millis() as u64,
+                            detokenizer_wait_ms,
+                            backend: "onnx",
+                        })
+                        .map_err(|err| ApiError::internal(err.to_string()));
                 let _ = request.reply_tx.send(result);
             }
         })
@@ -1313,22 +1337,126 @@ fn model_worker(
                 let _ = reply.send(result);
             }
             ModelCommand::Tts { request, reply } => {
-                let options = TTSOptions {
-                    system_prompt: resolve_tts_system_prompt(
-                        request.system_prompt.as_deref(),
-                        request.voice.as_deref(),
-                    ),
-                    max_new_tokens: request.max_tokens.unwrap_or(1024),
-                    text_temperature: request.text_temperature.unwrap_or(1.0),
-                    audio_temperature: request.audio_temperature.unwrap_or(0.8),
-                    audio_top_k: request.audio_top_k.unwrap_or(64),
-                };
+                let options = build_tts_options(&request);
                 let result = model
                     .tts()
                     .synthesize(&request.text, &options)
                     .and_then(|audio| encode_wav_bytes(&audio, 24_000))
                     .map(|wav_bytes| TtsResponse { wav_bytes })
                     .map_err(|err| ApiError::internal(err.to_string()));
+                let _ = reply.send(result);
+            }
+            ModelCommand::TtsStream {
+                request,
+                stream,
+                reply,
+            } => {
+                let options = build_tts_options(&request);
+                let mut audio_decoder =
+                    match StreamingAudioDecoder::new(detokenizer.clone(), stream_decode, 0) {
+                        Ok(decoder) => decoder,
+                        Err(err) => {
+                            let _ = reply.send(Err(err));
+                            continue;
+                        }
+                    };
+                let stream_started_at = Instant::now();
+                let mut emitted_audio_chunks = 0usize;
+                let mut emitted_audio_bytes = 0usize;
+                let mut first_audio_chunk_at_ms = None;
+                let mut audio_frame_index = 0usize;
+                let mut last_audio_frame_at = None;
+                let result = model
+                    .tts()
+                    .synthesize_streaming(&request.text, &options, &mut |event| {
+                        match event {
+                            lfm2_audio::TTSEvent::TextUpdated(text) => stream
+                                .blocking_send(AssistantStreamEvent::TextUpdated(text))
+                                .map_err(|_| {
+                                    lfm2_audio::LFM2Error::Generation(
+                                        "stream receiver dropped".to_string(),
+                                    )
+                                })?,
+                            lfm2_audio::TTSEvent::AudioFrame(frame) => {
+                                audio_frame_index += 1;
+                                let frame_elapsed_ms =
+                                    stream_started_at.elapsed().as_millis() as u64;
+                                let frame_gap_ms = last_audio_frame_at
+                                    .replace(Instant::now())
+                                    .map(|instant| instant.elapsed().as_millis() as u64)
+                                    .unwrap_or(0);
+                                if let Some(chunk) = audio_decoder
+                                    .push_frame(frame)
+                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
+                                {
+                                    emit_streaming_audio_chunk(
+                                        &stream,
+                                        chunk,
+                                        &mut emitted_audio_chunks,
+                                        &mut emitted_audio_bytes,
+                                        &mut first_audio_chunk_at_ms,
+                                        0,
+                                        audio_frame_index,
+                                        frame_elapsed_ms,
+                                        frame_gap_ms,
+                                        stream_started_at,
+                                        false,
+                                    )
+                                    .map_err(|err| {
+                                        lfm2_audio::LFM2Error::Generation(err.message)
+                                    })?;
+                                }
+                                for chunk in audio_decoder
+                                    .drain_ready()
+                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
+                                {
+                                    emit_streaming_audio_chunk(
+                                        &stream,
+                                        chunk,
+                                        &mut emitted_audio_chunks,
+                                        &mut emitted_audio_bytes,
+                                        &mut first_audio_chunk_at_ms,
+                                        0,
+                                        audio_frame_index,
+                                        frame_elapsed_ms,
+                                        frame_gap_ms,
+                                        stream_started_at,
+                                        false,
+                                    )
+                                    .map_err(|err| {
+                                        lfm2_audio::LFM2Error::Generation(err.message)
+                                    })?;
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                    .map_err(|err| ApiError::internal(err.to_string()))
+                    .and_then(|response| {
+                        for chunk in audio_decoder
+                            .finish()
+                            .map_err(|err| ApiError::internal(err.message))?
+                        {
+                            let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
+                            emit_streaming_audio_chunk(
+                                &stream,
+                                chunk,
+                                &mut emitted_audio_chunks,
+                                &mut emitted_audio_bytes,
+                                &mut first_audio_chunk_at_ms,
+                                0,
+                                audio_frame_index,
+                                elapsed_ms,
+                                0,
+                                stream_started_at,
+                                true,
+                            )?;
+                        }
+                        Ok(AssistantTurn {
+                            user_transcript: None,
+                            text: response.text,
+                        })
+                    });
                 let _ = reply.send(result);
             }
             ModelCommand::SessionStart {
@@ -1363,14 +1491,17 @@ fn model_worker(
                     ))
                 });
                 session.add_user_text(&text);
-                let mut audio_decoder =
-                    match StreamingAudioDecoder::new(detokenizer.clone(), stream_decode, session_id) {
-                        Ok(decoder) => decoder,
-                        Err(err) => {
-                            let _ = reply.send(Err(err));
-                            continue;
-                        }
-                    };
+                let mut audio_decoder = match StreamingAudioDecoder::new(
+                    detokenizer.clone(),
+                    stream_decode,
+                    session_id,
+                ) {
+                    Ok(decoder) => decoder,
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
+                };
                 let stream_started_at = Instant::now();
                 let mut emitted_audio_chunks = 0usize;
                 let mut emitted_audio_bytes = 0usize;
@@ -1419,7 +1550,9 @@ fn model_worker(
                                         stream_started_at,
                                         false,
                                     )
-                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                    .map_err(|err| {
+                                        lfm2_audio::LFM2Error::Generation(err.message)
+                                    })?;
                                 }
                                 for chunk in audio_decoder
                                     .drain_ready()
@@ -1438,7 +1571,9 @@ fn model_worker(
                                         stream_started_at,
                                         false,
                                     )
-                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                    .map_err(|err| {
+                                        lfm2_audio::LFM2Error::Generation(err.message)
+                                    })?;
                                 }
                             }
                         }
@@ -1489,8 +1624,8 @@ fn model_worker(
                     session_id,
                     input_sample_rate = sample_rate,
                     input_samples = audio.len(),
-                    input_duration_ms = ((audio.len() as f64 / sample_rate as f64) * 1000.0)
-                        .round() as u64,
+                    input_duration_ms =
+                        ((audio.len() as f64 / sample_rate as f64) * 1000.0).round() as u64,
                     has_text_prompt = text_prompt.is_some(),
                     "streaming audio turn started"
                 );
@@ -1502,14 +1637,17 @@ fn model_worker(
                 });
                 let add_result =
                     session.add_user_audio_with_text(&audio, sample_rate, text_prompt.as_deref());
-                let mut audio_decoder =
-                    match StreamingAudioDecoder::new(detokenizer.clone(), stream_decode, session_id) {
-                        Ok(decoder) => decoder,
-                        Err(err) => {
-                            let _ = reply.send(Err(err));
-                            continue;
-                        }
-                    };
+                let mut audio_decoder = match StreamingAudioDecoder::new(
+                    detokenizer.clone(),
+                    stream_decode,
+                    session_id,
+                ) {
+                    Ok(decoder) => decoder,
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                        continue;
+                    }
+                };
                 let stream_started_at = Instant::now();
                 let mut emitted_audio_chunks = 0usize;
                 let mut emitted_audio_bytes = 0usize;
@@ -1544,9 +1682,10 @@ fn model_worker(
                                             frame_gap_ms,
                                             "audio frame generated"
                                         );
-                                        if let Some(chunk) = audio_decoder
-                                            .push_frame(frame)
-                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
+                                        if let Some(chunk) =
+                                            audio_decoder.push_frame(frame).map_err(|err| {
+                                                lfm2_audio::LFM2Error::Generation(err.message)
+                                            })?
                                         {
                                             emit_streaming_audio_chunk(
                                                 &stream,
@@ -1561,12 +1700,15 @@ fn model_worker(
                                                 stream_started_at,
                                                 false,
                                             )
-                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                            .map_err(
+                                                |err| {
+                                                    lfm2_audio::LFM2Error::Generation(err.message)
+                                                },
+                                            )?;
                                         }
-                                        for chunk in audio_decoder
-                                            .drain_ready()
-                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
-                                        {
+                                        for chunk in audio_decoder.drain_ready().map_err(|err| {
+                                            lfm2_audio::LFM2Error::Generation(err.message)
+                                        })? {
                                             emit_streaming_audio_chunk(
                                                 &stream,
                                                 chunk,
@@ -1580,7 +1722,11 @@ fn model_worker(
                                                 stream_started_at,
                                                 false,
                                             )
-                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                            .map_err(
+                                                |err| {
+                                                    lfm2_audio::LFM2Error::Generation(err.message)
+                                                },
+                                            )?;
                                         }
                                     }
                                 }
@@ -1712,11 +1858,88 @@ async fn synthesize(
     Ok(([(header::CONTENT_TYPE, "audio/wav")], response.wav_bytes).into_response())
 }
 
+async fn tts_stream_socket(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_tts_socket(socket, state))
+}
+
 async fn interleaved_socket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn handle_tts_socket(mut socket: WebSocket, state: AppState) {
+    let _ = send_ws_json(&mut socket, &ServerWsMessage::Status { phase: "listening" }).await;
+
+    while let Some(message) = socket.next().await {
+        let message = match message {
+            Ok(message) => message,
+            Err(err) => {
+                warn!("tts websocket receive error: {}", err);
+                break;
+            }
+        };
+
+        let result = match message {
+            Message::Text(text) => match serde_json::from_str::<TtsWsClientMessage>(&text) {
+                Ok(TtsWsClientMessage::TtsRequest {
+                    text,
+                    voice,
+                    system_prompt,
+                    max_tokens,
+                    text_temperature,
+                    audio_temperature,
+                    audio_top_k,
+                }) => {
+                    handle_tts_stream_request(
+                        &mut socket,
+                        &state,
+                        TtsRequest {
+                            text,
+                            voice,
+                            system_prompt,
+                            max_tokens,
+                            text_temperature,
+                            audio_temperature,
+                            audio_top_k,
+                        },
+                    )
+                    .await
+                }
+                Ok(TtsWsClientMessage::Ping) => {
+                    send_ws_json(&mut socket, &ServerWsMessage::Pong).await
+                }
+                Err(err) => Err(ApiError::bad_request(format!(
+                    "invalid TTS websocket JSON: {}",
+                    err
+                ))),
+            },
+            Message::Ping(payload) => socket
+                .send(Message::Pong(payload))
+                .await
+                .map_err(|err| ApiError::internal(err.to_string())),
+            Message::Pong(_) => Ok(()),
+            Message::Close(_) => break,
+            Message::Binary(_) => Err(ApiError::unsupported(
+                "binary messages are not supported on /ws/tts",
+            )),
+        };
+
+        if let Err(err) = result {
+            let _ = send_ws_json(
+                &mut socket,
+                &ServerWsMessage::Error {
+                    message: &err.message,
+                },
+            )
+            .await;
+            break;
+        }
+    }
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
@@ -2045,6 +2268,44 @@ async fn handle_client_message(
             Ok(())
         }
     }
+}
+
+async fn handle_tts_stream_request(
+    socket: &mut WebSocket,
+    state: &AppState,
+    request: TtsRequest,
+) -> ApiResult<()> {
+    if request.text.trim().is_empty() {
+        return Err(ApiError::bad_request("text must not be empty"));
+    }
+
+    send_ws_json(
+        socket,
+        &ServerWsMessage::Status {
+            phase: "processing",
+        },
+    )
+    .await?;
+    let worker_index = next_worker_index(state);
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let (stream_tx, mut stream_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+
+    state.workers[worker_index]
+        .send(ModelCommand::TtsStream {
+            request,
+            stream: stream_tx,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ApiError::internal("model worker unavailable"))?;
+
+    let _stream_summary = send_streaming_assistant_events(socket, &mut stream_rx).await?;
+    let response = reply_rx
+        .await
+        .map_err(|_| ApiError::internal("streaming TTS reply dropped"))??;
+    send_assistant_turn(socket, &response).await?;
+    send_ws_json(socket, &ServerWsMessage::Status { phase: "done" }).await?;
+    Ok(())
 }
 
 fn handle_binary_audio(
@@ -2417,14 +2678,22 @@ impl FakeDetokenizerClient {
 #[cfg(test)]
 impl DetokenizerClient for FakeDetokenizerClient {
     fn submit(&mut self, request: DetokenizeRequest) -> ApiResult<()> {
-        let mut state = self.state.lock().expect("fake detokenizer state should lock");
+        let mut state = self
+            .state
+            .lock()
+            .expect("fake detokenizer state should lock");
         state.submitted_window_frames.push(request.codes.len());
-        state.pending_requests.push_back((request.decode_index, request.codes.len()));
+        state
+            .pending_requests
+            .push_back((request.decode_index, request.codes.len()));
         Ok(())
     }
 
     fn try_complete(&mut self) -> ApiResult<Option<DetokenizeCompletion>> {
-        let mut state = self.state.lock().expect("fake detokenizer state should lock");
+        let mut state = self
+            .state
+            .lock()
+            .expect("fake detokenizer state should lock");
         let Some(result) = state.ready_results.pop_front() else {
             return Ok(None);
         };
@@ -2433,7 +2702,10 @@ impl DetokenizerClient for FakeDetokenizerClient {
     }
 
     fn recv_complete(&mut self) -> ApiResult<DetokenizeCompletion> {
-        let mut state = self.state.lock().expect("fake detokenizer state should lock");
+        let mut state = self
+            .state
+            .lock()
+            .expect("fake detokenizer state should lock");
         if let Some(result) = state.ready_results.pop_front() {
             state.pending_requests.pop_front();
             return result;
@@ -2534,14 +2806,27 @@ fn resolve_tts_system_prompt(system_prompt: Option<&str>, voice: Option<&str>) -
     }
 }
 
+fn build_tts_options(request: &TtsRequest) -> TTSOptions {
+    TTSOptions {
+        system_prompt: resolve_tts_system_prompt(
+            request.system_prompt.as_deref(),
+            request.voice.as_deref(),
+        ),
+        max_new_tokens: request.max_tokens.unwrap_or(1024),
+        text_temperature: request.text_temperature.unwrap_or(1.0),
+        audio_temperature: request.audio_temperature.unwrap_or(0.8),
+        audio_top_k: request.audio_top_k.unwrap_or(64),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         background_worker_index, chunk_playback_duration, effective_worker_count,
-        parse_device_preference, split_new_waveform_tail, DetokenizeCompletion,
-        Device, DevicePreference, FakeDetokenizerClient, OutputQueueConfig,
-        STREAM_DECODE_BATCH_FRAMES, STREAM_DECODE_CONTEXT_FRAMES, STREAM_OUTPUT_QUEUE_CHUNKS,
-        StreamingAudioDecoder, AudioOutputPacer, spawn_detokenizer_worker,
+        parse_device_preference, spawn_detokenizer_worker, split_new_waveform_tail,
+        AudioOutputPacer, DetokenizeCompletion, Device, DevicePreference, FakeDetokenizerClient,
+        OutputQueueConfig, StreamingAudioDecoder, STREAM_DECODE_BATCH_FRAMES,
+        STREAM_DECODE_CONTEXT_FRAMES, STREAM_OUTPUT_QUEUE_CHUNKS,
     };
     use lfm2_audio::{LFM2Audio, Precision, TTSOptions};
     use std::path::PathBuf;
@@ -2668,11 +2953,20 @@ mod tests {
             7,
         );
 
-        assert!(decoder.push_frame([1; 8]).expect("push should succeed").is_none());
-        assert!(decoder.push_frame([2; 8]).expect("push should succeed").is_none());
+        assert!(decoder
+            .push_frame([1; 8])
+            .expect("push should succeed")
+            .is_none());
+        assert!(decoder
+            .push_frame([2; 8])
+            .expect("push should succeed")
+            .is_none());
         assert_eq!(recorder.submitted_window_frames(), vec![2]);
 
-        assert!(decoder.push_frame([3; 8]).expect("push should succeed").is_none());
+        assert!(decoder
+            .push_frame([3; 8])
+            .expect("push should succeed")
+            .is_none());
         assert_eq!(
             recorder.submitted_window_frames(),
             vec![2],
@@ -2692,7 +2986,10 @@ mod tests {
         assert_eq!(ready[0].emitted_samples, 3_840);
         assert_eq!(ready[0].detokenizer_wait_ms, 4);
 
-        assert!(decoder.push_frame([4; 8]).expect("push should succeed").is_none());
+        assert!(decoder
+            .push_frame([4; 8])
+            .expect("push should succeed")
+            .is_none());
         assert_eq!(recorder.submitted_window_frames(), vec![2, 4]);
     }
 
@@ -2706,9 +3003,18 @@ mod tests {
             9,
         );
 
-        assert!(decoder.push_frame([1; 8]).expect("push should succeed").is_none());
-        assert!(decoder.push_frame([2; 8]).expect("push should succeed").is_none());
-        assert!(decoder.push_frame([3; 8]).expect("push should succeed").is_none());
+        assert!(decoder
+            .push_frame([1; 8])
+            .expect("push should succeed")
+            .is_none());
+        assert!(decoder
+            .push_frame([2; 8])
+            .expect("push should succeed")
+            .is_none());
+        assert!(decoder
+            .push_frame([3; 8])
+            .expect("push should succeed")
+            .is_none());
         assert_eq!(recorder.submitted_window_frames(), vec![2]);
 
         recorder.complete_next(DetokenizeCompletion::from_waveform(
@@ -2737,9 +3043,18 @@ mod tests {
             11,
         );
 
-        assert!(decoder.push_frame([1; 8]).expect("push should succeed").is_none());
-        assert!(decoder.push_frame([2; 8]).expect("push should succeed").is_none());
-        assert!(decoder.push_frame([3; 8]).expect("push should succeed").is_none());
+        assert!(decoder
+            .push_frame([1; 8])
+            .expect("push should succeed")
+            .is_none());
+        assert!(decoder
+            .push_frame([2; 8])
+            .expect("push should succeed")
+            .is_none());
+        assert!(decoder
+            .push_frame([3; 8])
+            .expect("push should succeed")
+            .is_none());
 
         recorder.complete_next(DetokenizeCompletion::from_waveform(
             1,
@@ -2750,7 +3065,10 @@ mod tests {
         ));
 
         let ready = decoder.push_frame([4; 8]).expect("push should succeed");
-        assert!(ready.is_some(), "pushing the next batch should surface the completed prior batch");
+        assert!(
+            ready.is_some(),
+            "pushing the next batch should surface the completed prior batch"
+        );
 
         assert_eq!(
             recorder.submitted_window_frames(),
@@ -2803,15 +3121,14 @@ mod tests {
             99,
         )
         .expect("dedicated detokenizer worker should load");
-        let mut decoder = StreamingAudioDecoder::new(
-            detokenizer,
-            super::StreamingDecodeConfig::new(4, 16),
-            0,
-        )
-        .expect("ONNX streaming decoder should load");
+        let mut decoder =
+            StreamingAudioDecoder::new(detokenizer, super::StreamingDecodeConfig::new(4, 16), 0)
+                .expect("ONNX streaming decoder should load");
         let mut streamed_bytes = Vec::new();
         for frame in &audio_codes {
-            decoder.push_frame(*frame).expect("push_frame should succeed");
+            decoder
+                .push_frame(*frame)
+                .expect("push_frame should succeed");
             for chunk in decoder.drain_ready().expect("drain_ready should succeed") {
                 streamed_bytes.extend_from_slice(&chunk.bytes);
             }

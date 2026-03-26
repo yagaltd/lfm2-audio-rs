@@ -1,23 +1,23 @@
 //! Tokenizer wrapper for HuggingFace tokenizers
 
-use tokenizers::Tokenizer as HFTokenizer;
 use std::path::Path;
+use tokenizers::Tokenizer as HFTokenizer;
 
 use crate::error::{LFM2Error, Result};
 
 /// Special token IDs
 #[derive(Debug, Clone)]
 pub struct SpecialTokens {
-    pub pad: u32,                    // 0: <|pad|>
-    pub start_of_text: u32,          // 1: <|startoftext|>
-    pub end_of_text: u32,            // 2: <|endoftext|>
-    pub im_start: u32,               // 6: <|im_start|>
-    pub im_end: u32,                 // 7: <|im_end|>
-    pub audio_start: u32,            // 128: <|audio_start|>
-    pub text_start: u32,             // 129: <|text_start|>
-    pub text_end: u32,               // 130: <|text_end|>
-    pub mixed_start: u32,            // 131: <|mixed_start|>
-    pub mixed_end: u32,              // 132: <|mixed_end|>
+    pub pad: u32,           // 0: <|pad|>
+    pub start_of_text: u32, // 1: <|startoftext|>
+    pub end_of_text: u32,   // 2: <|endoftext|>
+    pub im_start: u32,      // 6: <|im_start|>
+    pub im_end: u32,        // 7: <|im_end|>
+    pub audio_start: u32,   // 128: <|audio_start|>
+    pub text_start: u32,    // 129: <|text_start|>
+    pub text_end: u32,      // 130: <|text_end|>
+    pub mixed_start: u32,   // 131: <|mixed_start|>
+    pub mixed_end: u32,     // 132: <|mixed_end|>
 }
 
 impl Default for SpecialTokens {
@@ -71,7 +71,8 @@ impl LFM2Tokenizer {
 
     /// Encode text to token IDs
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Vec<u32> {
-        let encoding = self.tokenizer
+        let encoding = self
+            .tokenizer
             .encode(text, add_special_tokens)
             .expect("Encoding should not fail");
 
@@ -116,8 +117,7 @@ impl LFM2Tokenizer {
 
     /// Check if token is end-of-sequence
     pub fn is_eos(&self, token_id: u32) -> bool {
-        token_id == self.special.end_of_text ||
-        token_id == self.special.im_end
+        token_id == self.special.end_of_text || token_id == self.special.im_end
     }
 
     /// Check if token is audio start

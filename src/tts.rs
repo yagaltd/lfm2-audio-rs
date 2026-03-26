@@ -5,7 +5,7 @@
 use crate::cache::GenerationCache;
 use crate::error::{LFM2Error, Result};
 use crate::model::LFM2Audio;
-use crate::tokenizer::{END_OF_AUDIO_TOKEN, NUM_CODEBOOKS, CODEBOOK_VOCAB};
+use crate::tokenizer::{CODEBOOK_VOCAB, END_OF_AUDIO_TOKEN, NUM_CODEBOOKS};
 
 /// TTS pipeline
 pub struct TTSPipeline<'a> {
@@ -40,6 +40,18 @@ pub struct TTSDebugOutput {
     pub text_tokens: Vec<u32>,
     pub audio_codes: Vec<[u16; 8]>,
     pub audio: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TTSEvent {
+    TextUpdated(String),
+    AudioFrame([u16; 8]),
+}
+
+#[derive(Debug, Clone)]
+pub struct TTSStreamOutput {
+    pub text: String,
+    pub audio_codes: Vec<[u16; 8]>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,23 +99,49 @@ impl<'a> TTSPipeline<'a> {
         Ok(self.synthesize_debug(text, options)?.audio)
     }
 
+    pub fn synthesize_streaming<F>(
+        &self,
+        text: &str,
+        options: &TTSOptions,
+        on_event: &mut F,
+    ) -> Result<TTSStreamOutput>
+    where
+        F: FnMut(TTSEvent) -> Result<()>,
+    {
+        let (text_tokens, mut cache, mut hidden_states, mut current_len) =
+            self.generate_text_streaming(text, options, on_event)?;
+        let audio_codes = self.generate_audio_codes_streaming(
+            &mut cache,
+            &mut hidden_states,
+            &mut current_len,
+            options,
+            on_event,
+        )?;
+        Ok(TTSStreamOutput {
+            text: self.model.tokenizer.decode(&text_tokens, true),
+            audio_codes,
+        })
+    }
+
     /// Synthesize text to speech and return intermediate generation artifacts.
     pub fn synthesize_debug(&self, text: &str, options: &TTSOptions) -> Result<TTSDebugOutput> {
-        log::info!("TTS: Synthesizing '{}'", text.chars().take(50).collect::<String>());
+        log::info!(
+            "TTS: Synthesizing '{}'",
+            text.chars().take(50).collect::<String>()
+        );
 
         // Phase 1: Generate text tokens until <|audio_start|>
         let (text_tokens, mut cache, mut hidden_states, mut current_len) =
             self.generate_text(text, options)?;
 
-        log::info!("TTS: Text phase complete, {} tokens, entering audio mode", text_tokens.len());
+        log::info!(
+            "TTS: Text phase complete, {} tokens, entering audio mode",
+            text_tokens.len()
+        );
 
         // Phase 2: Generate audio codes autoregressively
-        let audio_codes = self.generate_audio_codes(
-            &mut cache,
-            &mut hidden_states,
-            &mut current_len,
-            options,
-        )?;
+        let audio_codes =
+            self.generate_audio_codes(&mut cache, &mut hidden_states, &mut current_len, options)?;
 
         log::info!("TTS: Generated {} audio frames", audio_codes.len());
 
@@ -202,7 +240,7 @@ impl<'a> TTSPipeline<'a> {
         let attention_mask = ndarray::Array2::<i64>::ones((1, current_len));
 
         // Prefill
-        let (mut logits, mut hidden_states) = 
+        let (mut logits, mut hidden_states) =
             self.run_decoder_with_hidden(&input_embeds, &attention_mask, &mut cache)?;
 
         let mut text_tokens = Vec::new();
@@ -210,7 +248,8 @@ impl<'a> TTSPipeline<'a> {
         let audio_start_token = self.model.tokenizer.special_tokens().audio_start;
 
         // Generate text tokens
-        for _ in 0..options.max_new_tokens / 2 { // Reserve half for audio
+        for _ in 0..options.max_new_tokens / 2 {
+            // Reserve half for audio
             let last_logits = extract_last_logits(&logits, vocab_size)?;
             let next_token = if options.text_temperature == 0.0 {
                 argmax(&last_logits)
@@ -237,10 +276,10 @@ impl<'a> TTSPipeline<'a> {
             current_len += 1;
             let next_mask = ndarray::Array2::<i64>::ones((1, current_len));
 
-            let (new_logits, new_hidden) = 
+            let (new_logits, new_hidden) =
                 self.run_decoder_with_hidden(&next_embeds, &next_mask, &mut cache)?;
             logits = new_logits;
-            
+
             // Update hidden states
             hidden_states = new_hidden;
         }
@@ -251,11 +290,78 @@ impl<'a> TTSPipeline<'a> {
             current_len += 1;
             let audio_mask = ndarray::Array2::<i64>::ones((1, current_len));
 
-            let (_logits, hidden_states) = 
+            let (_logits, hidden_states) =
                 self.run_decoder_with_hidden(&audio_embeds, &audio_mask, &mut cache)?;
 
             return Ok((text_tokens, cache, hidden_states, current_len));
         }
+
+        Ok((text_tokens, cache, hidden_states, current_len))
+    }
+
+    fn generate_text_streaming<F>(
+        &self,
+        text: &str,
+        options: &TTSOptions,
+        on_event: &mut F,
+    ) -> Result<(Vec<u32>, GenerationCache, ndarray::Array3<f32>, usize)>
+    where
+        F: FnMut(TTSEvent) -> Result<()>,
+    {
+        let prompt = format!(
+            "<|startoftext|><|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            options.system_prompt,
+            text
+        );
+
+        let input_ids = self.model.tokenizer.encode(&prompt, false);
+        let input_embeds = self.model.get_text_embeddings(&input_ids);
+        let mut current_len = input_ids.len();
+        let mut cache = self.model.init_cache()?;
+        let attention_mask = ndarray::Array2::<i64>::ones((1, current_len));
+        let (mut logits, _hidden_states) =
+            self.run_decoder_with_hidden(&input_embeds, &attention_mask, &mut cache)?;
+
+        let mut text_tokens = Vec::new();
+        let vocab_size = self.model.config.lfm.vocab_size;
+        let audio_start_token = self.model.tokenizer.special_tokens().audio_start;
+
+        for _ in 0..options.max_new_tokens / 2 {
+            let last_logits = extract_last_logits(&logits, vocab_size)?;
+            let next_token = if options.text_temperature == 0.0 {
+                argmax(&last_logits)
+            } else {
+                sample_with_temperature(&last_logits, options.text_temperature)
+            };
+
+            if next_token == audio_start_token {
+                log::debug!("TTS: Audio start token reached");
+                break;
+            }
+
+            if self.model.tokenizer.is_eos(next_token) {
+                log::warn!("TTS: EOS before audio start, forcing audio");
+                break;
+            }
+
+            text_tokens.push(next_token);
+            on_event(TTSEvent::TextUpdated(
+                self.model.tokenizer.decode(&text_tokens, true),
+            ))?;
+
+            let next_embeds = self.model.get_text_embeddings(&[next_token]);
+            current_len += 1;
+            let next_mask = ndarray::Array2::<i64>::ones((1, current_len));
+            let (new_logits, _new_hidden) =
+                self.run_decoder_with_hidden(&next_embeds, &next_mask, &mut cache)?;
+            logits = new_logits;
+        }
+
+        let audio_embeds = self.model.get_text_embeddings(&[audio_start_token]);
+        current_len += 1;
+        let audio_mask = ndarray::Array2::<i64>::ones((1, current_len));
+        let (_logits, hidden_states) =
+            self.run_decoder_with_hidden(&audio_embeds, &audio_mask, &mut cache)?;
 
         Ok((text_tokens, cache, hidden_states, current_len))
     }
@@ -296,10 +402,54 @@ impl<'a> TTSPipeline<'a> {
             let attention_mask = ndarray::Array2::<i64>::ones((1, *current_len));
 
             // Run decoder step and get new hidden states
-            let (_logits, new_hidden_states) = 
+            let (_logits, new_hidden_states) =
                 self.run_decoder_with_hidden(&audio_embeds, &attention_mask, cache)?;
-            
+
             // Update hidden states and extract last position for next iteration
+            *hidden_states = new_hidden_states;
+            last_hidden = self.extract_last_hidden(hidden_states);
+        }
+
+        Ok(audio_codes)
+    }
+
+    fn generate_audio_codes_streaming<F>(
+        &self,
+        cache: &mut crate::cache::GenerationCache,
+        hidden_states: &mut ndarray::Array3<f32>,
+        current_len: &mut usize,
+        options: &TTSOptions,
+        on_event: &mut F,
+    ) -> Result<Vec<[u16; 8]>>
+    where
+        F: FnMut(TTSEvent) -> Result<()>,
+    {
+        let mut audio_codes = Vec::new();
+        let mut last_hidden = self.extract_last_hidden(hidden_states);
+
+        for frame_idx in 0..options.max_new_tokens {
+            let frame_codes = self.sample_audio_codes(
+                &last_hidden,
+                options.audio_temperature,
+                options.audio_top_k,
+            )?;
+
+            if frame_codes[0] == END_OF_AUDIO_TOKEN {
+                log::debug!("TTS: End of audio at frame {}", frame_idx);
+                break;
+            }
+
+            on_event(TTSEvent::AudioFrame(frame_codes))?;
+            audio_codes.push(frame_codes);
+
+            let clamped_codes = frame_codes.map(|c| c.min(2047));
+            let audio_embeds = self.model.get_audio_embeddings(&clamped_codes)?;
+            *current_len += 1;
+            let attention_mask = ndarray::Array2::<i64>::ones((1, *current_len));
+
+            let (_logits, new_hidden_states) =
+                self.run_decoder_with_hidden(&audio_embeds, &attention_mask, cache)?;
+
             *hidden_states = new_hidden_states;
             last_hidden = self.extract_last_hidden(hidden_states);
         }
@@ -315,7 +465,7 @@ impl<'a> TTSPipeline<'a> {
         if seq_len == 0 {
             return vec![0.0f32; self.model.config.lfm.hidden_size];
         }
-        
+
         hidden_states
             .slice(ndarray::s![0, seq_len - 1, ..])
             .iter()
@@ -330,12 +480,8 @@ impl<'a> TTSPipeline<'a> {
         temperature: f32,
         top_k: usize,
     ) -> Result<[u16; 8]> {
-        let (codes, _trace) = self.sample_audio_codes_with_trace(
-            hidden_state,
-            temperature,
-            top_k,
-            None,
-        )?;
+        let (codes, _trace) =
+            self.sample_audio_codes_with_trace(hidden_state, temperature, top_k, None)?;
         Ok(codes)
     }
 
@@ -384,10 +530,8 @@ impl<'a> TTSPipeline<'a> {
         let mut codes = [0u16; 8];
         let mut prev_token = 0i64;
 
-        let hidden_array = ndarray::Array2::from_shape_vec(
-            (1, hidden_state.len()),
-            hidden_state.to_vec(),
-        )?;
+        let hidden_array =
+            ndarray::Array2::from_shape_vec((1, hidden_state.len()), hidden_state.to_vec())?;
 
         // Depthformer expects packed cache tensors (not per-layer past_key_values.* inputs)
         // Shapes follow the ONNX graph:
@@ -417,7 +561,7 @@ impl<'a> TTSPipeline<'a> {
             let past_values_contig = past_values.as_standard_layout().to_owned();
             let seqlens_k_contig = seqlens_k.as_standard_layout().to_owned();
             let total_seq_len_contig = total_seq_len.as_standard_layout().to_owned();
-            
+
             let t_hidden = ort::value::Value::from_array(hidden_contig)?;
             let t_depth_slices = ort::value::Value::from_array(depth_slices_contig)?;
             let t_step = ort::value::Value::from_array(step_contig)?;
@@ -426,7 +570,7 @@ impl<'a> TTSPipeline<'a> {
             let t_past_values = ort::value::Value::from_array(past_values_contig)?;
             let t_seqlens_k = ort::value::Value::from_array(seqlens_k_contig)?;
             let t_total_seq_len = ort::value::Value::from_array(total_seq_len_contig)?;
-            
+
             let mut depthformer = self.model.sessions.depthformer.borrow_mut();
             let outputs = depthformer.run(vec![
                 ("hidden_states".to_string(), t_hidden.into_dyn()),
@@ -440,7 +584,8 @@ impl<'a> TTSPipeline<'a> {
             ])?;
 
             // Extract logits
-            let logits_output = outputs.get("logits")
+            let logits_output = outputs
+                .get("logits")
                 .ok_or_else(|| LFM2Error::Generation("depthformer logits not found".to_string()))?;
             let (_, logits_data) = logits_output.try_extract_tensor::<f32>()?;
             let logits: Vec<f32> = logits_data.to_vec();
@@ -452,7 +597,11 @@ impl<'a> TTSPipeline<'a> {
             let token = if temperature == 0.0 {
                 argmax_token
             } else {
-                sample_top_k(&logits[..CODEBOOK_VOCAB.min(logits.len())], temperature, top_k)
+                sample_top_k(
+                    &logits[..CODEBOOK_VOCAB.min(logits.len())],
+                    temperature,
+                    top_k,
+                )
             };
 
             codes[codebook_idx] = token as u16;
@@ -470,11 +619,15 @@ impl<'a> TTSPipeline<'a> {
             // Feed depthformer recurrent outputs back as next-step inputs.
             let depth_slices = outputs
                 .get("depth_slices")
-                .ok_or_else(|| LFM2Error::Generation("depthformer depth_slices not found".to_string()))?
+                .ok_or_else(|| {
+                    LFM2Error::Generation("depthformer depth_slices not found".to_string())
+                })?
                 .try_extract_array::<f32>()?
                 .to_owned()
                 .into_dimensionality::<ndarray::Ix3>()
-                .map_err(|e| LFM2Error::Generation(format!("Invalid depth_slices shape: {:?}", e)))?;
+                .map_err(|e| {
+                    LFM2Error::Generation(format!("Invalid depth_slices shape: {:?}", e))
+                })?;
             depth_slices_in = depth_slices;
 
             let new_keys = outputs
@@ -488,7 +641,9 @@ impl<'a> TTSPipeline<'a> {
 
             let new_values = outputs
                 .get("new_values")
-                .ok_or_else(|| LFM2Error::Generation("depthformer new_values not found".to_string()))?
+                .ok_or_else(|| {
+                    LFM2Error::Generation("depthformer new_values not found".to_string())
+                })?
                 .try_extract_array::<f32>()?
                 .to_owned()
                 .into_dimensionality::<ndarray::Ix5>()
@@ -510,11 +665,7 @@ impl<'a> TTSPipeline<'a> {
         self.decode_audio_codes_impl(codes, false)
     }
 
-    fn decode_audio_codes_impl(
-        &self,
-        codes: &[[u16; 8]],
-        normalize: bool,
-    ) -> Result<Vec<f32>> {
+    fn decode_audio_codes_impl(&self, codes: &[[u16; 8]], normalize: bool) -> Result<Vec<f32>> {
         if codes.is_empty() {
             return Ok(Vec::new());
         }
@@ -555,12 +706,13 @@ impl<'a> TTSPipeline<'a> {
 
         let view = features_output.try_extract_array::<f32>()?;
         let shape = view.shape();
-        
+
         // Expected shape: [1, num_frames, 1282] or [num_frames, 1282]
         if shape.len() < 2 {
-            return Err(LFM2Error::Generation(
-                format!("Expected 2D or 3D output, got {:?}", shape)
-            ));
+            return Err(LFM2Error::Generation(format!(
+                "Expected 2D or 3D output, got {:?}",
+                shape
+            )));
         }
 
         let (out_frames, feature_dim) = if shape.len() == 3 {
@@ -570,13 +722,16 @@ impl<'a> TTSPipeline<'a> {
         };
 
         if feature_dim != 1282 {
-            log::warn!("TTS: Unexpected feature dimension {}, expected 1282", feature_dim);
+            log::warn!(
+                "TTS: Unexpected feature dimension {}, expected 1282",
+                feature_dim
+            );
         }
 
         // Extract features and split into log_abs and angle
         let flat: Vec<f32> = view.iter().copied().collect();
         let n_freqs = 641; // feature_dim / 2 = 1282 / 2
-        
+
         let mut log_abs_data = Vec::with_capacity(out_frames * n_freqs);
         let mut angle_data = Vec::with_capacity(out_frames * n_freqs);
 
@@ -594,10 +749,10 @@ impl<'a> TTSPipeline<'a> {
 
         // Detokenizer output is frame-major [time, feature]. Build [time, freq] first,
         // then transpose to the [freq, time] layout expected by ISTFT.
-        let log_abs = ndarray::Array2::from_shape_vec((out_frames, n_freqs), log_abs_data)?
-            .reversed_axes();
-        let angle = ndarray::Array2::from_shape_vec((out_frames, n_freqs), angle_data)?
-            .reversed_axes();
+        let log_abs =
+            ndarray::Array2::from_shape_vec((out_frames, n_freqs), log_abs_data)?.reversed_axes();
+        let angle =
+            ndarray::Array2::from_shape_vec((out_frames, n_freqs), angle_data)?.reversed_axes();
 
         // Apply ISTFT
         // n_fft=1280, hop_length=320, win_length=1280 (from Python reference)
@@ -618,11 +773,14 @@ impl<'a> TTSPipeline<'a> {
             }
         }
 
-        log::info!("TTS: Decoded {} frames -> {} audio samples", out_frames, waveform.len());
+        log::info!(
+            "TTS: Decoded {} frames -> {} audio samples",
+            out_frames,
+            waveform.len()
+        );
 
         Ok(waveform)
     }
-
 
     pub(crate) fn run_decoder_with_hidden(
         &self,
@@ -638,28 +796,32 @@ impl<'a> TTSPipeline<'a> {
 
         // Get cache inputs (now returns DynValue directly)
         let cache_inputs = cache.prepare_cache_inputs();
-        
-        log::debug!("Cache inputs: {:?}", cache_inputs.iter().map(|(n, _)| n).collect::<Vec<_>>());
-        
+
+        log::debug!(
+            "Cache inputs: {:?}",
+            cache_inputs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+
         // Build input list
         let mut inputs_list: Vec<(String, ort::value::DynValue)> = vec![
             ("inputs_embeds".to_string(), t_inputs.into_dyn()),
             ("attention_mask".to_string(), t_mask.into_dyn()),
         ];
-        
+
         // Add cache inputs (already DynValue)
         for (name, value) in cache_inputs {
             inputs_list.push((name, value));
         }
-        
+
         log::debug!("Running decoder with {} inputs", inputs_list.len());
-        
+
         // Run decoder
         let mut decoder = self.model.sessions.decoder.borrow_mut();
         let outputs = decoder.run(inputs_list)?;
 
         // Extract logits
-        let logits_output = outputs.get("logits")
+        let logits_output = outputs
+            .get("logits")
             .ok_or_else(|| LFM2Error::Generation("logits not found".to_string()))?;
 
         let view = logits_output.try_extract_array::<f32>()?;
@@ -673,10 +835,7 @@ impl<'a> TTSPipeline<'a> {
         }
 
         let flat: Vec<f32> = view.iter().copied().collect();
-        let logits = ndarray::Array3::from_shape_vec(
-            (shape[0], shape[1], shape[2]),
-            flat,
-        )?;
+        let logits = ndarray::Array3::from_shape_vec((shape[0], shape[1], shape[2]), flat)?;
 
         // Extract hidden_states if available
         let hidden_size = self.model.config.lfm.hidden_size;
@@ -714,7 +873,8 @@ fn extract_last_logits(logits: &ndarray::Array3<f32>, vocab_size: usize) -> Resu
 }
 
 fn argmax(logits: &[f32]) -> u32 {
-    logits.iter()
+    logits
+        .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(idx, _)| idx as u32)
@@ -726,18 +886,12 @@ fn sample_with_temperature(logits: &[f32], temperature: f32) -> u32 {
         return argmax(logits);
     }
 
-    let scaled: Vec<f32> = logits.iter()
-        .map(|&x| x / temperature)
-        .collect();
+    let scaled: Vec<f32> = logits.iter().map(|&x| x / temperature).collect();
 
     let max_logit = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exp_shifted: Vec<f32> = scaled.iter()
-        .map(|&x| (x - max_logit).exp())
-        .collect();
+    let exp_shifted: Vec<f32> = scaled.iter().map(|&x| (x - max_logit).exp()).collect();
     let sum_exp: f32 = exp_shifted.iter().sum();
-    let probs: Vec<f32> = exp_shifted.iter()
-        .map(|&x| x / sum_exp)
-        .collect();
+    let probs: Vec<f32> = exp_shifted.iter().map(|&x| x / sum_exp).collect();
 
     use rand::Rng;
     let mut rng = rand::thread_rng();
@@ -804,7 +958,7 @@ pub fn decode_audio_codes_standalone(
     codes: &[[u16; 8]],
 ) -> Result<Vec<f32>> {
     use crate::audio::istft::ISTFT;
-    
+
     if codes.is_empty() {
         return Ok(Vec::new());
     }
@@ -822,24 +976,25 @@ pub fn decode_audio_codes_standalone(
     let t_codes = ort::value::Value::from_array(codes_contig)?;
 
     // Run audio detokenizer
-    let outputs = detokenizer.run(ort::inputs! {
-        "audio_codes" => t_codes,
-    }).map_err(LFM2Error::Onnx)?;
+    let outputs = detokenizer
+        .run(ort::inputs! {
+            "audio_codes" => t_codes,
+        })
+        .map_err(LFM2Error::Onnx)?;
 
     // Extract features
-    let features_output = outputs.get("stft_features")
+    let features_output = outputs
+        .get("stft_features")
         .or_else(|| outputs.get("output"))
         .or_else(|| outputs.get("waveform"))
         .or_else(|| outputs.get("stft"))
-        .ok_or_else(|| LFM2Error::Generation(
-            "detokenizer output not found".to_string()
-        ))?;
+        .ok_or_else(|| LFM2Error::Generation("detokenizer output not found".to_string()))?;
 
     let view = features_output
         .try_extract_array::<f32>()
         .map_err(LFM2Error::Onnx)?;
     let shape = view.shape();
-    
+
     let (out_frames, feature_dim) = if shape.len() == 3 {
         (shape[1], shape[2])
     } else {
@@ -848,7 +1003,7 @@ pub fn decode_audio_codes_standalone(
 
     let n_freqs = 641; // feature_dim / 2
     let flat: Vec<f32> = view.iter().copied().collect();
-    
+
     // Extract spectrogram
     let mut log_abs_data = Vec::with_capacity(out_frames * n_freqs);
     let mut angle_data = Vec::with_capacity(out_frames * n_freqs);
@@ -863,10 +1018,9 @@ pub fn decode_audio_codes_standalone(
         }
     }
 
-    let log_abs = ndarray::Array2::from_shape_vec((out_frames, n_freqs), log_abs_data)?
-        .reversed_axes();
-    let angle = ndarray::Array2::from_shape_vec((out_frames, n_freqs), angle_data)?
-        .reversed_axes();
+    let log_abs =
+        ndarray::Array2::from_shape_vec((out_frames, n_freqs), log_abs_data)?.reversed_axes();
+    let angle = ndarray::Array2::from_shape_vec((out_frames, n_freqs), angle_data)?.reversed_axes();
 
     // ISTFT
     let istft = ISTFT::new(1280, 320, 1280);

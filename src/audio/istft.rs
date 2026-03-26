@@ -99,7 +99,12 @@ impl ISTFT {
         // Trim padding
         let start_idx = pad;
         let end_idx = output_size - pad;
-        let result: Vec<f32> = y.iter().skip(start_idx).take(end_idx - start_idx).copied().collect();
+        let result: Vec<f32> = y
+            .iter()
+            .skip(start_idx)
+            .take(end_idx - start_idx)
+            .copied()
+            .collect();
 
         Ok(result)
     }
@@ -147,7 +152,8 @@ fn hann_window(window_length: usize) -> Vec<f32> {
 
     (0..window_length)
         .map(|i| {
-            0.5 - 0.5 * ((2.0 * std::f32::consts::PI * i as f32) / (window_length as f32 - 1.0)).cos()
+            0.5 - 0.5
+                * ((2.0 * std::f32::consts::PI * i as f32) / (window_length as f32 - 1.0)).cos()
         })
         .collect()
 }
