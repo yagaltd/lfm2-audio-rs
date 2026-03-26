@@ -45,6 +45,7 @@ const DEFAULT_MODEL_DIR: &str = "/home/aurel/Documents/vibe/STT-rust/LFM2.5-Audi
 const DEFAULT_KITTEN_TTS_DIR: &str = "/home/aurel/Documents/vibe/STT-rust/kitten-tts-models/kitten-tts-nano-int8";
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_SYSTEM_PROMPT_INTERLEAVED: &str = "Respond with interleaved text and audio.";
+const DEFAULT_SYSTEM_PROMPT_TEXT_ONLY: &str = "Respond with text only. Do not generate audio.";
 const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_DECODE_BATCH_FRAMES: usize = 1;
@@ -1139,8 +1140,13 @@ fn model_worker(
                     "streaming text turn started"
                 );
                 let session = sessions.entry(session_id).or_insert_with(|| {
+                    let prompt = if text_only {
+                        DEFAULT_SYSTEM_PROMPT_TEXT_ONLY
+                    } else {
+                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED
+                    };
                     model.chat_with_options(apply_interleaved_overrides(
-                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED.to_string(),
+                        prompt.to_string(),
                         interleaved_overrides,
                     ))
                 });
@@ -1301,8 +1307,13 @@ fn model_worker(
                     "streaming audio turn started"
                 );
                 let session = sessions.entry(session_id).or_insert_with(|| {
+                    let prompt = if text_only {
+                        DEFAULT_SYSTEM_PROMPT_TEXT_ONLY
+                    } else {
+                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED
+                    };
                     model.chat_with_options(apply_interleaved_overrides(
-                        DEFAULT_SYSTEM_PROMPT_INTERLEAVED.to_string(),
+                        prompt.to_string(),
                         interleaved_overrides,
                     ))
                 });
