@@ -215,4 +215,4 @@ ONNX Runtime sessions  : execution backend through Rust ort
 
 ## License
 
-MIT OR Apache-2.0
+MIT
