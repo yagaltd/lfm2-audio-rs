@@ -24,6 +24,9 @@ const silenceTimeoutInput = document.getElementById("silenceTimeout");
 const minSpeechMsInput = document.getElementById("minSpeechMs");
 const showTranscriptInput = document.getElementById("showTranscript");
 const fastTtsModeInput = document.getElementById("fastTtsMode");
+if (!fastTtsModeInput) {
+  console.error("fastTtsMode checkbox not found!");
+}
 const connectionState = document.getElementById("connectionState");
 const phaseState = document.getElementById("phaseState");
 const vadMeter = document.getElementById("vadMeter");
@@ -328,12 +331,14 @@ function connectSocket() {
     setPhase("Listening");
     updateControls();
     const ttsBackend = fastTtsModeInput.checked ? "kitten" : "lfm2";
-    log(`WebSocket connected (TTS: ${ttsBackend})`);
-    ws.send(JSON.stringify({
+    const msg = {
       type: "session.start",
       system_prompt: systemPromptInput.value.trim(),
       tts_backend: ttsBackend,
-    }));
+    };
+    log(`WebSocket connected (TTS: ${ttsBackend}, checked=${fastTtsModeInput.checked})`);
+    console.log("Sending session.start:", msg);
+    ws.send(JSON.stringify(msg));
   });
 
   ws.addEventListener("close", () => {
@@ -738,6 +743,12 @@ ttsBackend.addEventListener("change", () => {
   }
 });
 ttsVoice.disabled = ttsBackend.value !== "kitten";
+
+// Fast TTS mode toggle - requires reconnect to take effect
+fastTtsModeInput.addEventListener("change", () => {
+  const mode = fastTtsModeInput.checked ? "KittenTTS (~50ms/frame)" : "LFM2 (~90ms/frame)";
+  log(`TTS mode changed to ${mode}. ${ws && ws.readyState === WebSocket.OPEN ? "Reconnect to apply." : "Will apply on next connection."}`);
+});
 
 updateVadThresholdLabel();
 updateControls();

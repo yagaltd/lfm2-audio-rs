@@ -1662,7 +1662,10 @@ async fn handle_client_message(
         ClientWsMessage::SessionStart { system_prompt, tts_backend } => {
             // Store the TTS backend preference for this session
             if let Some(backend) = tts_backend {
+                info!(session_id, tts_backend = %backend, "Session TTS backend set");
                 session_settings.tts_backend = backend;
+            } else {
+                info!(session_id, "Session using default TTS backend (lfm2)");
             }
             
             let prompt =
@@ -1695,6 +1698,10 @@ async fn handle_client_message(
                 },
             )
             .await?;
+            
+            // Use text-only mode for hybrid pipeline (LFM2 text → KittenTTS audio)
+            let text_only = session_settings.tts_backend == "kitten";
+            info!(session_id, tts_backend = %session_settings.tts_backend, text_only, "Processing text turn");
             let worker_index = session_worker_index(state, session_id).await;
             let (reply_tx, reply_rx) = oneshot::channel();
             let (stream_tx, mut stream_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
