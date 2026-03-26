@@ -1,6 +1,8 @@
 class AssistantPlayerWorklet extends AudioWorkletProcessor {
   constructor() {
     super();
+    this.startThresholdSamples = 128;
+    this.resumeThresholdSamples = 128;
     this.queue = [];
     this.chunkOffset = 0;
     this.queuedSamples = 0;
@@ -23,13 +25,20 @@ class AssistantPlayerWorklet extends AudioWorkletProcessor {
         const chunk = new Float32Array(event.data.samples);
         this.queue.push(chunk);
         this.queuedSamples += chunk.length;
-        this.inUnderrun = false;
-        if (!this.started) {
+        if (!this.started && this.queuedSamples >= this.resumeTargetSamples()) {
+          const reason = this.inUnderrun ? "playback-resumed" : "playback-started";
           this.started = true;
-          this.reportState("playback-started");
+          this.inUnderrun = false;
+          this.reportState(reason);
         }
       }
     };
+  }
+
+  resumeTargetSamples() {
+    return this.inUnderrun
+      ? this.resumeThresholdSamples
+      : this.startThresholdSamples;
   }
 
   reportState(reason) {
@@ -77,6 +86,7 @@ class AssistantPlayerWorklet extends AudioWorkletProcessor {
 
     if (written < output.length) {
       if (!this.inUnderrun) {
+        this.started = false;
         this.inUnderrun = true;
         this.underruns += 1;
         this.reportState("underrun");

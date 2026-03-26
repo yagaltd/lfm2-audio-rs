@@ -18,9 +18,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     env,
+    fs::{self, File, OpenOptions},
+    io::{BufWriter, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
+        mpsc as std_mpsc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
@@ -34,7 +37,8 @@ use tower_http::{
 use tracing::{info, warn};
 
 use lfm2_audio::{
-    decode_wav_bytes, encode_wav_bytes, ASROptions, Device,
+    decode_wav_bytes, encode_wav_bytes,
+    sessions::load_audio_detokenizer_session_with_threads, ASROptions, Device,
     InterleavedOptions, LFM2Audio, Precision, TTSOptions,
 };
 
@@ -46,6 +50,9 @@ const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_DECODE_BATCH_FRAMES: usize = 2;
 const STREAM_DECODE_CONTEXT_FRAMES: usize = 0;
 const STREAM_OUTPUT_QUEUE_CHUNKS: usize = 1;
+const STREAM_SAMPLES_PER_FRAME: usize = 1_920;
+const STREAM_DETOKENIZER_MAX_INFLIGHT_BATCHES: usize = 1;
+const STREAM_DETOKENIZER_INTRA_THREADS: usize = 1;
 
 #[derive(Clone)]
 struct AppState {
@@ -53,6 +60,7 @@ struct AppState {
     next_session_id: Arc<AtomicU64>,
     next_worker: Arc<AtomicUsize>,
     session_workers: Arc<AsyncMutex<HashMap<u64, usize>>>,
+    interleaved_trace: Option<Arc<InterleavedTraceLogger>>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +74,101 @@ struct ServerConfig {
     interleaved_n_text: Option<usize>,
     interleaved_n_audio: Option<usize>,
     stream_decode: StreamingDecodeConfig,
+    interleaved_log_path: Option<PathBuf>,
+}
+
+struct InterleavedTraceLogger {
+    writer: std::sync::Mutex<BufWriter<File>>,
+}
+
+#[derive(Debug, Serialize)]
+struct InterleavedTraceEvent<'a> {
+    ts_ms: u128,
+    session_id: u64,
+    #[serde(flatten)]
+    payload: InterleavedTracePayload<'a>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum InterleavedTracePayload<'a> {
+    SessionStarted {
+        system_prompt: &'a str,
+    },
+    UserText {
+        text: &'a str,
+    },
+    UserAudio {
+        sample_rate: u32,
+        input_samples: usize,
+        input_duration_ms: u64,
+        text_prompt: Option<&'a str>,
+        include_transcript: bool,
+    },
+    AssistantTurn {
+        user_transcript: Option<&'a str>,
+        text: &'a str,
+        stream: Option<InterleavedTraceStreamSummary>,
+    },
+    SessionReset,
+    SessionClosed,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+struct InterleavedTraceStreamSummary {
+    saw_stream_event: bool,
+    sent_audio: bool,
+    chunk_count: usize,
+    audio_samples: usize,
+    first_frame_elapsed_ms: Option<u64>,
+    first_decode_elapsed_ms: Option<u64>,
+    first_detokenizer_wait_ms: Option<u64>,
+    max_frame_gap_ms: u64,
+    max_decode_elapsed_ms: u64,
+    max_detokenizer_wait_ms: u64,
+    max_queue_wait_ms: u64,
+}
+
+impl InterleavedTraceLogger {
+    fn new(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        Ok(Self {
+            writer: std::sync::Mutex::new(BufWriter::new(file)),
+        })
+    }
+
+    fn log<'a>(&self, session_id: u64, payload: InterleavedTracePayload<'a>) {
+        let event = InterleavedTraceEvent {
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0),
+            session_id,
+            payload,
+        };
+        let Ok(serialized) = serde_json::to_string(&event) else {
+            warn!(session_id, "failed to serialize interleaved trace event");
+            return;
+        };
+        let mut writer = match self.writer.lock() {
+            Ok(writer) => writer,
+            Err(_) => {
+                warn!(session_id, "interleaved trace logger lock poisoned");
+                return;
+            }
+        };
+        if let Err(err) = writeln!(writer, "{}", serialized).and_then(|_| writer.flush()) {
+            warn!(session_id, error = %err, "failed to write interleaved trace event");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -154,6 +257,9 @@ impl ServerConfig {
         let mut interleaved_n_audio = env::var("LFM2_INTERLEAVED_N_AUDIO")
             .ok()
             .and_then(|value| value.parse().ok());
+        let mut interleaved_log_path = env::var("LFM2_INTERLEAVED_LOG_PATH")
+            .ok()
+            .map(PathBuf::from);
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -227,6 +333,12 @@ impl ServerConfig {
                             .context("invalid --interleaved-n-audio value")?,
                     );
                 }
+                "--interleaved-log" => {
+                    interleaved_log_path = Some(PathBuf::from(
+                        args.next()
+                            .ok_or_else(|| anyhow!("missing value for --interleaved-log"))?,
+                    ));
+                }
                 other => return Err(anyhow!("unknown argument: {}", other)),
             }
         }
@@ -244,6 +356,7 @@ impl ServerConfig {
                 stream_batch_frames,
                 stream_context_frames,
             ),
+            interleaved_log_path,
         })
     }
 }
@@ -410,6 +523,7 @@ enum AssistantStreamEvent {
         frame_elapsed_ms: u64,
         frame_gap_ms: u64,
         decode_elapsed_ms: u64,
+        detokenizer_wait_ms: u64,
         backend: &'static str,
         produced_at: Instant,
     },
@@ -421,7 +535,98 @@ struct DecodedAudioChunk {
     decode_index: usize,
     emitted_samples: usize,
     decode_elapsed_ms: u64,
+    detokenizer_wait_ms: u64,
     backend: &'static str,
+}
+
+type DetokenizeResult = ApiResult<DetokenizeCompletion>;
+
+struct DetokenizeRequest {
+    decode_index: usize,
+    codes: Vec<[u16; 8]>,
+    submitted_at: Instant,
+    reply_tx: std_mpsc::Sender<DetokenizeResult>,
+}
+
+#[derive(Debug, Clone)]
+struct DetokenizeCompletion {
+    decode_index: usize,
+    waveform: Vec<f32>,
+    decode_elapsed_ms: u64,
+    detokenizer_wait_ms: u64,
+    backend: &'static str,
+}
+
+impl DetokenizeCompletion {
+    #[cfg(test)]
+    fn from_waveform(
+        decode_index: usize,
+        waveform: Vec<f32>,
+        decode_elapsed_ms: u64,
+        detokenizer_wait_ms: u64,
+        backend: &'static str,
+    ) -> Self {
+        Self {
+            decode_index,
+            waveform,
+            decode_elapsed_ms,
+            detokenizer_wait_ms,
+            backend,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DetokenizerWorkerHandle {
+    request_tx: std_mpsc::Sender<DetokenizeRequest>,
+}
+
+trait DetokenizerClient {
+    fn submit(&mut self, request: DetokenizeRequest) -> ApiResult<()>;
+    fn try_complete(&mut self) -> ApiResult<Option<DetokenizeCompletion>>;
+    fn recv_complete(&mut self) -> ApiResult<DetokenizeCompletion>;
+}
+
+struct WorkerDetokenizerClient {
+    request_tx: std_mpsc::Sender<DetokenizeRequest>,
+    result_tx: std_mpsc::Sender<DetokenizeResult>,
+    result_rx: std_mpsc::Receiver<DetokenizeResult>,
+}
+
+impl WorkerDetokenizerClient {
+    fn new(handle: DetokenizerWorkerHandle) -> Self {
+        let (result_tx, result_rx) = std_mpsc::channel();
+        Self {
+            request_tx: handle.request_tx,
+            result_tx,
+            result_rx,
+        }
+    }
+}
+
+impl DetokenizerClient for WorkerDetokenizerClient {
+    fn submit(&mut self, mut request: DetokenizeRequest) -> ApiResult<()> {
+        request.reply_tx = self.result_tx.clone();
+        self.request_tx
+            .send(request)
+            .map_err(|_| ApiError::internal("dedicated detokenizer worker is unavailable"))
+    }
+
+    fn try_complete(&mut self) -> ApiResult<Option<DetokenizeCompletion>> {
+        match self.result_rx.try_recv() {
+            Ok(result) => result.map(Some),
+            Err(std_mpsc::TryRecvError::Empty) => Ok(None),
+            Err(std_mpsc::TryRecvError::Disconnected) => Err(ApiError::internal(
+                "dedicated detokenizer worker disconnected",
+            )),
+        }
+    }
+
+    fn recv_complete(&mut self) -> ApiResult<DetokenizeCompletion> {
+        self.result_rx
+            .recv()
+            .map_err(|_| ApiError::internal("dedicated detokenizer worker disconnected"))?
+    }
 }
 
 enum ModelCommand {
@@ -463,16 +668,25 @@ enum ModelCommand {
     },
 }
 
-struct OnnxStreamingAudioDecoder<'a> {
-    tts: lfm2_audio::TTSPipeline<'a>,
+struct InflightDecode {
+    decode_index: usize,
+    submitted_frame_count: usize,
+    pending_frames: usize,
+    flushed_frames: usize,
+    zero_context: bool,
+}
+
+struct StreamingAudioDecoder {
+    client: Box<dyn DetokenizerClient + Send>,
     all_codes: Vec<[u16; 8]>,
     flushed_frames: usize,
     batch_frames: usize,
     context_frames: usize,
     session_id: u64,
     decode_index: usize,
-    /// Number of samples already emitted (avoids re-decoding context)
     last_emitted_samples: usize,
+    inflight: VecDeque<InflightDecode>,
+    ready_chunks: VecDeque<DecodedAudioChunk>,
 }
 
 fn split_new_waveform_tail(
@@ -493,10 +707,26 @@ fn split_new_waveform_tail(
     Ok((waveform[last_emitted_samples..].to_vec(), next_emitted_samples))
 }
 
-impl<'a> OnnxStreamingAudioDecoder<'a> {
-    fn new(model: &'a LFM2Audio, config: StreamingDecodeConfig, session_id: u64) -> Self {
+impl StreamingAudioDecoder {
+    fn new(
+        detokenizer: DetokenizerWorkerHandle,
+        config: StreamingDecodeConfig,
+        session_id: u64,
+    ) -> ApiResult<Self> {
+        Ok(Self::new_with_client(
+            Box::new(WorkerDetokenizerClient::new(detokenizer)),
+            config,
+            session_id,
+        ))
+    }
+
+    fn new_with_client(
+        client: Box<dyn DetokenizerClient + Send>,
+        config: StreamingDecodeConfig,
+        session_id: u64,
+    ) -> Self {
         Self {
-            tts: model.tts(),
+            client,
             all_codes: Vec::new(),
             flushed_frames: 0,
             batch_frames: config.batch_frames,
@@ -504,75 +734,224 @@ impl<'a> OnnxStreamingAudioDecoder<'a> {
             session_id,
             decode_index: 0,
             last_emitted_samples: 0,
+            inflight: VecDeque::new(),
+            ready_chunks: VecDeque::new(),
         }
     }
 
     fn push_frame(&mut self, frame: [u16; 8]) -> ApiResult<Option<DecodedAudioChunk>> {
         self.all_codes.push(frame);
-        if self.pending_frames() < self.batch_frames {
-            return Ok(None);
+        if self.context_frames == 0 {
+            self.submit_zero_context_batches(false)?;
+            self.cap_zero_context_backlog()?;
+        } else {
+            self.submit_pending_if_idle(false)?;
         }
-        self.decode_pending()
+        Ok(self.ready_chunks.pop_front())
     }
 
-    fn finish(&mut self) -> ApiResult<Option<DecodedAudioChunk>> {
-        if self.pending_frames() == 0 {
-            return Ok(None);
+    fn drain_ready(&mut self) -> ApiResult<Vec<DecodedAudioChunk>> {
+        let mut ready = self.ready_chunks.drain(..).collect::<Vec<_>>();
+
+        loop {
+            if self.context_frames == 0 {
+                self.submit_zero_context_batches(false)?;
+            } else {
+                self.submit_pending_if_idle(false)?;
+            }
+            let Some(completion) = self.client.try_complete()? else {
+                break;
+            };
+            if let Some(chunk) = self.process_completion(completion)? {
+                ready.push(chunk);
+            }
         }
-        self.decode_pending()
+
+        Ok(ready)
     }
 
-    fn decode_pending(&mut self) -> ApiResult<Option<DecodedAudioChunk>> {
-        let window_codes = self.all_codes.as_slice();
-        if window_codes.is_empty() {
-            return Ok(None);
+    fn finish(&mut self) -> ApiResult<Vec<DecodedAudioChunk>> {
+        let mut drained = self.drain_ready()?;
+
+        if self.context_frames == 0 {
+            self.submit_zero_context_batches(true)?;
         }
+
+        while !self.inflight.is_empty() {
+            let completion = self.client.recv_complete()?;
+            if let Some(chunk) = self.process_completion(completion)? {
+                drained.push(chunk);
+            }
+            if self.context_frames == 0 {
+                self.submit_zero_context_batches(true)?;
+            } else {
+                self.submit_pending_if_idle(true)?;
+            }
+        }
+
+        if self.context_frames > 0 && self.pending_frames() > 0 {
+            self.submit_pending_if_idle(true)?;
+            while !self.inflight.is_empty() {
+                let completion = self.client.recv_complete()?;
+                if let Some(chunk) = self.process_completion(completion)? {
+                    drained.push(chunk);
+                }
+                self.submit_pending_if_idle(true)?;
+            }
+        }
+
+        Ok(drained)
+    }
+
+    fn submit_pending_if_idle(&mut self, allow_partial: bool) -> ApiResult<()> {
+        if !self.inflight.is_empty() {
+            return Ok(());
+        }
+
         let pending_frames = self.pending_frames();
-        let window_frames = window_codes.len();
-        let flushed_frames = self.flushed_frames;
-        let decode_started_at = Instant::now();
+        if pending_frames == 0 || (!allow_partial && pending_frames < self.batch_frames) {
+            return Ok(());
+        }
 
-        // Decode the full window
-        let waveform = self
-            .tts
-            .decode_audio_codes_raw(window_codes)
-            .map_err(|err| ApiError::internal(err.to_string()))?;
-
-        let full_decode_ms = decode_started_at.elapsed().as_millis() as u64;
-
-        let (new_waveform, next_emitted_samples) =
-            split_new_waveform_tail(waveform, self.last_emitted_samples)?;
-        self.last_emitted_samples = next_emitted_samples;
-
-        self.retain_recent_context();
-        let context_decode_ms = 0;
         let decode_index = self.decode_index + 1;
+        let submitted_frame_count = self.all_codes.len();
+        self.client.submit(DetokenizeRequest {
+            decode_index,
+            codes: self.all_codes.clone(),
+            submitted_at: Instant::now(),
+            reply_tx: std_mpsc::channel().0,
+        })?;
         self.decode_index = decode_index;
+        self.inflight.push_back(InflightDecode {
+            decode_index,
+            submitted_frame_count,
+            pending_frames,
+            flushed_frames: self.flushed_frames,
+            zero_context: false,
+        });
+
+        Ok(())
+    }
+
+    fn submit_zero_context_batches(&mut self, allow_partial: bool) -> ApiResult<()> {
+        while self.all_codes.len() >= self.batch_frames {
+            self.submit_zero_context_batch(self.batch_frames)?;
+        }
+
+        if allow_partial && !self.all_codes.is_empty() {
+            self.submit_zero_context_batch(self.all_codes.len())?;
+        }
+
+        Ok(())
+    }
+
+    fn submit_zero_context_batch(&mut self, frame_count: usize) -> ApiResult<()> {
+        let decode_index = self.decode_index + 1;
+        let codes = self.all_codes.drain(..frame_count).collect::<Vec<_>>();
+        self.client.submit(DetokenizeRequest {
+            decode_index,
+            codes,
+            submitted_at: Instant::now(),
+            reply_tx: std_mpsc::channel().0,
+        })?;
+        self.decode_index = decode_index;
+        self.inflight.push_back(InflightDecode {
+            decode_index,
+            submitted_frame_count: frame_count,
+            pending_frames: frame_count,
+            flushed_frames: 0,
+            zero_context: true,
+        });
+        Ok(())
+    }
+
+    fn cap_zero_context_backlog(&mut self) -> ApiResult<()> {
+        while self.inflight.len() > STREAM_DETOKENIZER_MAX_INFLIGHT_BATCHES {
+            let completion = self.client.recv_complete()?;
+            if let Some(chunk) = self.process_completion(completion)? {
+                self.ready_chunks.push_back(chunk);
+            }
+        }
+        Ok(())
+    }
+
+    fn process_completion(
+        &mut self,
+        completion: DetokenizeCompletion,
+    ) -> ApiResult<Option<DecodedAudioChunk>> {
+        let inflight = self
+            .inflight
+            .pop_front()
+            .ok_or_else(|| ApiError::internal("received detokenizer completion without in-flight request"))?;
+        if inflight.decode_index != completion.decode_index {
+            return Err(ApiError::internal(format!(
+                "detokenizer completion out of order: expected {}, got {}",
+                inflight.decode_index, completion.decode_index
+            )));
+        }
+
+        if inflight.zero_context {
+            info!(
+                session_id = self.session_id,
+                decode_index = completion.decode_index,
+                pending_frames = inflight.pending_frames,
+                window_frames = inflight.submitted_frame_count,
+                flushed_frames = inflight.flushed_frames,
+                batch_frames = self.batch_frames,
+                context_frames = self.context_frames,
+                emitted_samples = completion.waveform.len(),
+                full_decode_ms = completion.decode_elapsed_ms,
+                total_decode_ms = completion.decode_elapsed_ms,
+                detokenizer_wait_ms = completion.detokenizer_wait_ms,
+                retained_frames = self.all_codes.len(),
+                "streaming detokenizer flush"
+            );
+            return Ok(Some(DecodedAudioChunk {
+                bytes: encode_pcm_s16le_bytes(&completion.waveform),
+                decode_index: completion.decode_index,
+                emitted_samples: completion.waveform.len(),
+                decode_elapsed_ms: completion.decode_elapsed_ms,
+                detokenizer_wait_ms: completion.detokenizer_wait_ms,
+                backend: completion.backend,
+            }));
+        }
+
+        let window_frames = inflight.submitted_frame_count;
+        let pending_frames = inflight.pending_frames;
+        let flushed_frames = inflight.flushed_frames;
+        let (new_waveform, next_emitted_samples) =
+            split_new_waveform_tail(completion.waveform, self.last_emitted_samples)?;
+        self.last_emitted_samples = next_emitted_samples;
+        self.retain_recent_context_after_decode(window_frames)?;
+        let context_decode_ms = 0;
 
         if new_waveform.is_empty() {
             return Ok(None);
         }
+
         info!(
             session_id = self.session_id,
-            decode_index,
+            decode_index = completion.decode_index,
             pending_frames,
             window_frames,
             flushed_frames,
             batch_frames = self.batch_frames,
             context_frames = self.context_frames,
             emitted_samples = new_waveform.len(),
-            full_decode_ms,
+            full_decode_ms = completion.decode_elapsed_ms,
             context_decode_ms,
-            total_decode_ms = full_decode_ms,
+            total_decode_ms = completion.decode_elapsed_ms,
+            detokenizer_wait_ms = completion.detokenizer_wait_ms,
             retained_frames = self.all_codes.len(),
             "streaming detokenizer flush"
         );
         Ok(Some(DecodedAudioChunk {
             bytes: encode_pcm_s16le_bytes(&new_waveform),
-            decode_index,
+            decode_index: completion.decode_index,
             emitted_samples: new_waveform.len(),
-            decode_elapsed_ms: full_decode_ms,
-            backend: "onnx",
+            decode_elapsed_ms: completion.decode_elapsed_ms,
+            detokenizer_wait_ms: completion.detokenizer_wait_ms,
+            backend: completion.backend,
         }))
     }
 
@@ -580,41 +959,24 @@ impl<'a> OnnxStreamingAudioDecoder<'a> {
         self.all_codes.len().saturating_sub(self.flushed_frames)
     }
 
-    fn retain_recent_context(&mut self) {
-        let keep_start = self.all_codes.len().saturating_sub(self.context_frames);
+    fn retain_recent_context_after_decode(
+        &mut self,
+        completed_window_frames: usize,
+    ) -> ApiResult<()> {
+        if completed_window_frames > self.all_codes.len() {
+            return Err(ApiError::internal(
+                "detokenizer completed more frames than are buffered",
+            ));
+        }
+
+        let keep_start = completed_window_frames.saturating_sub(self.context_frames);
         if keep_start > 0 {
-            // When draining frames, adjust last_emitted_samples
-            // Each frame = 1920 samples (80ms at 24kHz)
-            const SAMPLES_PER_FRAME: usize = 1920;
-            let drained_samples = keep_start * SAMPLES_PER_FRAME;
+            let drained_samples = keep_start * STREAM_SAMPLES_PER_FRAME;
             self.last_emitted_samples = self.last_emitted_samples.saturating_sub(drained_samples);
             self.all_codes.drain(..keep_start);
         }
-        self.flushed_frames = self.all_codes.len();
-    }
-}
-
-struct StreamingAudioDecoder<'a>(OnnxStreamingAudioDecoder<'a>);
-
-impl<'a> StreamingAudioDecoder<'a> {
-    fn new(
-        model: &'a LFM2Audio,
-        onnx_config: StreamingDecodeConfig,
-        session_id: u64,
-    ) -> ApiResult<Self> {
-        Ok(Self(OnnxStreamingAudioDecoder::new(
-            model,
-            onnx_config,
-            session_id,
-        )))
-    }
-
-    fn push_frame(&mut self, frame: [u16; 8]) -> ApiResult<Option<DecodedAudioChunk>> {
-        self.0.push_frame(frame)
-    }
-
-    fn finish(&mut self) -> ApiResult<Option<DecodedAudioChunk>> {
-        self.0.finish()
+        self.flushed_frames = completed_window_frames.saturating_sub(keep_start);
+        Ok(())
     }
 }
 
@@ -672,6 +1034,7 @@ enum ServerWsMessage<'a> {
         frame_elapsed_ms: u64,
         frame_gap_ms: u64,
         decode_elapsed_ms: u64,
+        detokenizer_wait_ms: u64,
         queue_wait_ms: u64,
         chunk_samples: usize,
         backend: &'a str,
@@ -710,7 +1073,7 @@ async fn main() -> Result<()> {
     }
 
     info!(
-        "Loading model from {} with precision {:?} on {:?} using {} worker(s), interleaved_n_text={:?}, interleaved_n_audio={:?}, stream_batch_frames={}, stream_context_frames={}",
+        "Loading model from {} with precision {:?} on {:?} using {} worker(s), interleaved_n_text={:?}, interleaved_n_audio={:?}, stream_batch_frames={}, stream_context_frames={}, interleaved_log_path={:?}",
         config.model_path.display(),
         config.precision,
         device,
@@ -719,6 +1082,7 @@ async fn main() -> Result<()> {
         config.interleaved_n_audio,
         config.stream_decode.batch_frames,
         config.stream_decode.context_frames,
+        config.interleaved_log_path,
     );
 
     let mut workers = Vec::with_capacity(worker_count);
@@ -738,22 +1102,38 @@ async fn main() -> Result<()> {
                     LFM2Audio::from_pretrained(&model_path, precision, device)
                         .expect("failed to load worker model"),
                 ));
+                let detokenizer = spawn_detokenizer_worker(
+                    model_path.clone(),
+                    precision,
+                    device,
+                    worker_index,
+                )
+                .expect("failed to spawn dedicated detokenizer worker");
                 model_worker(
                     model,
                     rx,
                     stream_decode,
                     interleaved_overrides,
+                    detokenizer,
                 );
             })
             .map_err(|err| anyhow!("failed to spawn worker thread: {}", err))?;
         workers.push(tx);
     }
 
+    let interleaved_trace = config
+        .interleaved_log_path
+        .as_deref()
+        .map(InterleavedTraceLogger::new)
+        .transpose()?
+        .map(Arc::new);
+
     let state = AppState {
         workers: Arc::new(workers),
         next_session_id: Arc::new(AtomicU64::new(1)),
         next_worker: Arc::new(AtomicUsize::new(0)),
         session_workers: Arc::new(AsyncMutex::new(HashMap::new())),
+        interleaved_trace,
     };
 
     let app = build_router(&config, state);
@@ -817,11 +1197,95 @@ async fn close_session_worker(state: &AppState, session_id: u64) -> Option<usize
     state.session_workers.lock().await.remove(&session_id)
 }
 
+fn spawn_detokenizer_worker(
+    model_path: PathBuf,
+    precision: Precision,
+    device: Device,
+    worker_index: usize,
+) -> Result<DetokenizerWorkerHandle> {
+    let (request_tx, request_rx) = std_mpsc::channel::<DetokenizeRequest>();
+    std::thread::Builder::new()
+        .name(format!("lfm2-detokenizer-{}", worker_index))
+        .spawn(move || {
+            let mut detokenizer = load_audio_detokenizer_session_with_threads(
+                &model_path,
+                precision,
+                device,
+                STREAM_DETOKENIZER_INTRA_THREADS,
+            )
+                .expect("failed to load dedicated detokenizer session");
+
+            while let Ok(request) = request_rx.recv() {
+                let detokenizer_wait_ms = request.submitted_at.elapsed().as_millis() as u64;
+                let decode_started_at = Instant::now();
+                let result = lfm2_audio::decode_audio_codes_standalone(&mut detokenizer, &request.codes)
+                    .map(|waveform| DetokenizeCompletion {
+                        decode_index: request.decode_index,
+                        waveform,
+                        decode_elapsed_ms: decode_started_at.elapsed().as_millis() as u64,
+                        detokenizer_wait_ms,
+                        backend: "onnx",
+                    })
+                    .map_err(|err| ApiError::internal(err.to_string()));
+                let _ = request.reply_tx.send(result);
+            }
+        })
+        .map_err(|err| anyhow!("failed to spawn dedicated detokenizer worker: {}", err))?;
+    Ok(DetokenizerWorkerHandle { request_tx })
+}
+
+fn emit_streaming_audio_chunk(
+    stream: &mpsc::Sender<AssistantStreamEvent>,
+    chunk: DecodedAudioChunk,
+    emitted_audio_chunks: &mut usize,
+    emitted_audio_bytes: &mut usize,
+    first_audio_chunk_at_ms: &mut Option<u64>,
+    session_id: u64,
+    audio_frame_index: usize,
+    frame_elapsed_ms: u64,
+    frame_gap_ms: u64,
+    stream_started_at: Instant,
+    final_flush: bool,
+) -> ApiResult<()> {
+    *emitted_audio_chunks += 1;
+    *emitted_audio_bytes += chunk.bytes.len();
+    let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
+    first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
+    info!(
+        session_id,
+        chunk_index = *emitted_audio_chunks,
+        frame_index = audio_frame_index,
+        chunk_bytes = chunk.bytes.len(),
+        chunk_samples = chunk.emitted_samples,
+        decode_index = chunk.decode_index,
+        decode_elapsed_ms = chunk.decode_elapsed_ms,
+        detokenizer_wait_ms = chunk.detokenizer_wait_ms,
+        backend = chunk.backend,
+        elapsed_ms,
+        final_flush,
+        "streaming audio chunk ready"
+    );
+    stream
+        .blocking_send(AssistantStreamEvent::AudioChunk {
+            bytes: chunk.bytes,
+            chunk_index: *emitted_audio_chunks,
+            frame_index: audio_frame_index,
+            frame_elapsed_ms,
+            frame_gap_ms,
+            decode_elapsed_ms: chunk.decode_elapsed_ms,
+            detokenizer_wait_ms: chunk.detokenizer_wait_ms,
+            backend: chunk.backend,
+            produced_at: Instant::now(),
+        })
+        .map_err(|_| ApiError::internal("stream receiver dropped"))
+}
+
 fn model_worker(
     model: &'static LFM2Audio,
     mut rx: mpsc::Receiver<ModelCommand>,
     stream_decode: StreamingDecodeConfig,
     interleaved_overrides: InterleavedOverrides,
+    detokenizer: DetokenizerWorkerHandle,
 ) {
     let mut sessions: HashMap<u64, lfm2_audio::ChatSession<'static>> = HashMap::new();
 
@@ -900,7 +1364,7 @@ fn model_worker(
                 });
                 session.add_user_text(&text);
                 let mut audio_decoder =
-                    match StreamingAudioDecoder::new(model, stream_decode, session_id) {
+                    match StreamingAudioDecoder::new(detokenizer.clone(), stream_decode, session_id) {
                         Ok(decoder) => decoder,
                         Err(err) => {
                             let _ = reply.send(Err(err));
@@ -942,38 +1406,39 @@ fn model_worker(
                                     .push_frame(frame)
                                     .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
                                 {
-                                    emitted_audio_chunks += 1;
-                                    emitted_audio_bytes += chunk.bytes.len();
-                                    let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
-                                    first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
-                                    info!(
+                                    emit_streaming_audio_chunk(
+                                        &stream,
+                                        chunk,
+                                        &mut emitted_audio_chunks,
+                                        &mut emitted_audio_bytes,
+                                        &mut first_audio_chunk_at_ms,
                                         session_id,
-                                        chunk_index = emitted_audio_chunks,
-                                        frame_index = audio_frame_index,
-                                        chunk_bytes = chunk.bytes.len(),
-                                        chunk_samples = chunk.emitted_samples,
-                                        decode_index = chunk.decode_index,
-                                        decode_elapsed_ms = chunk.decode_elapsed_ms,
-                                        backend = chunk.backend,
-                                        elapsed_ms,
-                                        "streaming audio chunk ready"
-                                    );
-                                    stream
-                                        .blocking_send(AssistantStreamEvent::AudioChunk {
-                                            bytes: chunk.bytes,
-                                            chunk_index: emitted_audio_chunks,
-                                            frame_index: audio_frame_index,
-                                            frame_elapsed_ms,
-                                            frame_gap_ms,
-                                            decode_elapsed_ms: chunk.decode_elapsed_ms,
-                                            backend: chunk.backend,
-                                            produced_at: Instant::now(),
-                                        })
-                                        .map_err(|_| {
-                                            lfm2_audio::LFM2Error::Generation(
-                                                "stream receiver dropped".to_string(),
-                                            )
-                                        })?;
+                                        audio_frame_index,
+                                        frame_elapsed_ms,
+                                        frame_gap_ms,
+                                        stream_started_at,
+                                        false,
+                                    )
+                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                }
+                                for chunk in audio_decoder
+                                    .drain_ready()
+                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
+                                {
+                                    emit_streaming_audio_chunk(
+                                        &stream,
+                                        chunk,
+                                        &mut emitted_audio_chunks,
+                                        &mut emitted_audio_bytes,
+                                        &mut first_audio_chunk_at_ms,
+                                        session_id,
+                                        audio_frame_index,
+                                        frame_elapsed_ms,
+                                        frame_gap_ms,
+                                        stream_started_at,
+                                        false,
+                                    )
+                                    .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
                                 }
                             }
                         }
@@ -981,39 +1446,24 @@ fn model_worker(
                     })
                     .map_err(|err| ApiError::internal(err.to_string()))
                     .and_then(|response| {
-                        if let Some(chunk) = audio_decoder
+                        for chunk in audio_decoder
                             .finish()
                             .map_err(|err| ApiError::internal(err.message))?
                         {
-                            emitted_audio_chunks += 1;
-                            emitted_audio_bytes += chunk.bytes.len();
                             let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
-                            first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
-                            info!(
+                            emit_streaming_audio_chunk(
+                                &stream,
+                                chunk,
+                                &mut emitted_audio_chunks,
+                                &mut emitted_audio_bytes,
+                                &mut first_audio_chunk_at_ms,
                                 session_id,
-                                chunk_index = emitted_audio_chunks,
-                                frame_index = audio_frame_index,
-                                chunk_bytes = chunk.bytes.len(),
-                                chunk_samples = chunk.emitted_samples,
-                                decode_index = chunk.decode_index,
-                                decode_elapsed_ms = chunk.decode_elapsed_ms,
-                                backend = chunk.backend,
+                                audio_frame_index,
                                 elapsed_ms,
-                                final_flush = true,
-                                "streaming audio chunk ready"
-                            );
-                            stream
-                                .blocking_send(AssistantStreamEvent::AudioChunk {
-                                    bytes: chunk.bytes,
-                                    chunk_index: emitted_audio_chunks,
-                                    frame_index: audio_frame_index,
-                                    frame_elapsed_ms: elapsed_ms,
-                                    frame_gap_ms: 0,
-                                    decode_elapsed_ms: chunk.decode_elapsed_ms,
-                                    backend: chunk.backend,
-                                    produced_at: Instant::now(),
-                                })
-                                .map_err(|_| ApiError::internal("stream receiver dropped"))?;
+                                0,
+                                stream_started_at,
+                                true,
+                            )?;
                         }
                         assistant_turn_from_response(response, None)
                     });
@@ -1053,7 +1503,7 @@ fn model_worker(
                 let add_result =
                     session.add_user_audio_with_text(&audio, sample_rate, text_prompt.as_deref());
                 let mut audio_decoder =
-                    match StreamingAudioDecoder::new(model, stream_decode, session_id) {
+                    match StreamingAudioDecoder::new(detokenizer.clone(), stream_decode, session_id) {
                         Ok(decoder) => decoder,
                         Err(err) => {
                             let _ = reply.send(Err(err));
@@ -1098,38 +1548,39 @@ fn model_worker(
                                             .push_frame(frame)
                                             .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
                                         {
-                                            emitted_audio_chunks += 1;
-                                            emitted_audio_bytes += chunk.bytes.len();
-                                            let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
-                                            first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
-                                            info!(
+                                            emit_streaming_audio_chunk(
+                                                &stream,
+                                                chunk,
+                                                &mut emitted_audio_chunks,
+                                                &mut emitted_audio_bytes,
+                                                &mut first_audio_chunk_at_ms,
                                                 session_id,
-                                                chunk_index = emitted_audio_chunks,
-                                                frame_index = audio_frame_index,
-                                                chunk_bytes = chunk.bytes.len(),
-                                                chunk_samples = chunk.emitted_samples,
-                                                decode_index = chunk.decode_index,
-                                                decode_elapsed_ms = chunk.decode_elapsed_ms,
-                                                backend = chunk.backend,
-                                                elapsed_ms,
-                                                "streaming audio chunk ready"
-                                            );
-                                            stream
-                                                .blocking_send(AssistantStreamEvent::AudioChunk {
-                                                    bytes: chunk.bytes,
-                                                    chunk_index: emitted_audio_chunks,
-                                                    frame_index: audio_frame_index,
-                                                    frame_elapsed_ms,
-                                                    frame_gap_ms,
-                                                    decode_elapsed_ms: chunk.decode_elapsed_ms,
-                                                    backend: chunk.backend,
-                                                    produced_at: Instant::now(),
-                                                })
-                                                .map_err(|_| {
-                                                    lfm2_audio::LFM2Error::Generation(
-                                                        "stream receiver dropped".to_string(),
-                                                    )
-                                                })?;
+                                                audio_frame_index,
+                                                frame_elapsed_ms,
+                                                frame_gap_ms,
+                                                stream_started_at,
+                                                false,
+                                            )
+                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
+                                        }
+                                        for chunk in audio_decoder
+                                            .drain_ready()
+                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?
+                                        {
+                                            emit_streaming_audio_chunk(
+                                                &stream,
+                                                chunk,
+                                                &mut emitted_audio_chunks,
+                                                &mut emitted_audio_bytes,
+                                                &mut first_audio_chunk_at_ms,
+                                                session_id,
+                                                audio_frame_index,
+                                                frame_elapsed_ms,
+                                                frame_gap_ms,
+                                                stream_started_at,
+                                                false,
+                                            )
+                                            .map_err(|err| lfm2_audio::LFM2Error::Generation(err.message))?;
                                         }
                                     }
                                 }
@@ -1137,41 +1588,24 @@ fn model_worker(
                             })
                             .map_err(|err| ApiError::internal(err.to_string()))
                             .and_then(|response| {
-                                if let Some(chunk) = audio_decoder
+                                for chunk in audio_decoder
                                     .finish()
                                     .map_err(|err| ApiError::internal(err.message))?
                                 {
-                                    emitted_audio_chunks += 1;
-                                    emitted_audio_bytes += chunk.bytes.len();
                                     let elapsed_ms = stream_started_at.elapsed().as_millis() as u64;
-                                    first_audio_chunk_at_ms.get_or_insert(elapsed_ms);
-                                    info!(
+                                    emit_streaming_audio_chunk(
+                                        &stream,
+                                        chunk,
+                                        &mut emitted_audio_chunks,
+                                        &mut emitted_audio_bytes,
+                                        &mut first_audio_chunk_at_ms,
                                         session_id,
-                                        chunk_index = emitted_audio_chunks,
-                                        frame_index = audio_frame_index,
-                                        chunk_bytes = chunk.bytes.len(),
-                                        chunk_samples = chunk.emitted_samples,
-                                        decode_index = chunk.decode_index,
-                                        decode_elapsed_ms = chunk.decode_elapsed_ms,
-                                        backend = chunk.backend,
+                                        audio_frame_index,
                                         elapsed_ms,
-                                        final_flush = true,
-                                        "streaming audio chunk ready"
-                                    );
-                                    stream
-                                        .blocking_send(AssistantStreamEvent::AudioChunk {
-                                            bytes: chunk.bytes,
-                                            chunk_index: emitted_audio_chunks,
-                                            frame_index: audio_frame_index,
-                                            frame_elapsed_ms: elapsed_ms,
-                                            frame_gap_ms: 0,
-                                            decode_elapsed_ms: chunk.decode_elapsed_ms,
-                                            backend: chunk.backend,
-                                            produced_at: Instant::now(),
-                                        })
-                                        .map_err(|_| {
-                                            ApiError::internal("stream receiver dropped")
-                                        })?;
+                                        0,
+                                        stream_started_at,
+                                        true,
+                                    )?;
                                 }
                                 assistant_turn_from_response(response, None)
                             })
@@ -1353,6 +1787,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             .send(ModelCommand::SessionClose { session_id })
             .await;
     }
+    log_interleaved_event(&state, session_id, InterleavedTracePayload::SessionClosed);
 }
 
 async fn handle_client_message(
@@ -1371,7 +1806,7 @@ async fn handle_client_message(
             state.workers[worker_index]
                 .send(ModelCommand::SessionStart {
                     session_id,
-                    system_prompt: prompt,
+                    system_prompt: prompt.clone(),
                     reply: reply_tx,
                 })
                 .await
@@ -1379,6 +1814,13 @@ async fn handle_client_message(
             reply_rx
                 .await
                 .map_err(|_| ApiError::internal("session start reply dropped"))??;
+            log_interleaved_event(
+                state,
+                session_id,
+                InterleavedTracePayload::SessionStarted {
+                    system_prompt: &prompt,
+                },
+            );
             send_ws_json(socket, &ServerWsMessage::SessionStarted).await?;
             send_ws_json(socket, &ServerWsMessage::Status { phase: "listening" }).await?;
             Ok(())
@@ -1387,6 +1829,11 @@ async fn handle_client_message(
             if text.trim().is_empty() {
                 return Err(ApiError::bad_request("text turn must not be empty"));
             }
+            log_interleaved_event(
+                state,
+                session_id,
+                InterleavedTracePayload::UserText { text: &text },
+            );
             send_ws_json(
                 socket,
                 &ServerWsMessage::Status {
@@ -1407,12 +1854,33 @@ async fn handle_client_message(
                 })
                 .await
                 .map_err(|_| ApiError::internal("model worker unavailable"))?;
-            let _ = send_streaming_assistant_events(socket, &mut stream_rx).await?;
+            let stream_summary = send_streaming_assistant_events(socket, &mut stream_rx).await?;
             let response = reply_rx
                 .await
                 .map_err(|_| ApiError::internal("text reply dropped"))??;
 
             send_assistant_turn(socket, &response).await?;
+            log_interleaved_event(
+                state,
+                session_id,
+                InterleavedTracePayload::AssistantTurn {
+                    user_transcript: response.user_transcript.as_deref(),
+                    text: &response.text,
+                    stream: Some(InterleavedTraceStreamSummary {
+                        saw_stream_event: stream_summary.saw_stream_event,
+                        sent_audio: stream_summary.sent_audio,
+                        chunk_count: stream_summary.chunk_count,
+                        audio_samples: stream_summary.audio_samples,
+                        first_frame_elapsed_ms: stream_summary.first_frame_elapsed_ms,
+                        first_decode_elapsed_ms: stream_summary.first_decode_elapsed_ms,
+                        first_detokenizer_wait_ms: stream_summary.first_detokenizer_wait_ms,
+                        max_frame_gap_ms: stream_summary.max_frame_gap_ms,
+                        max_decode_elapsed_ms: stream_summary.max_decode_elapsed_ms,
+                        max_detokenizer_wait_ms: stream_summary.max_detokenizer_wait_ms,
+                        max_queue_wait_ms: stream_summary.max_queue_wait_ms,
+                    }),
+                },
+            );
             send_ws_json(socket, &ServerWsMessage::Status { phase: "listening" }).await?;
             Ok(())
         }
@@ -1450,6 +1918,18 @@ async fn handle_client_message(
             }
 
             let audio = pcm_s16le_bytes_to_f32(&pending.bytes)?;
+            log_interleaved_event(
+                state,
+                session_id,
+                InterleavedTracePayload::UserAudio {
+                    sample_rate: pending.sample_rate,
+                    input_samples: audio.len(),
+                    input_duration_ms: ((audio.len() as f64 / pending.sample_rate as f64) * 1000.0)
+                        .round() as u64,
+                    text_prompt: text_prompt.as_deref(),
+                    include_transcript,
+                },
+            );
             send_ws_json(
                 socket,
                 &ServerWsMessage::Status {
@@ -1492,7 +1972,7 @@ async fn handle_client_message(
                 None
             };
 
-            let _ = send_streaming_assistant_events(socket, &mut stream_rx).await?;
+            let stream_summary = send_streaming_assistant_events(socket, &mut stream_rx).await?;
 
             let mut response = chat_rx
                 .await
@@ -1517,6 +1997,27 @@ async fn handle_client_message(
             }
 
             send_assistant_turn(socket, &response).await?;
+            log_interleaved_event(
+                state,
+                session_id,
+                InterleavedTracePayload::AssistantTurn {
+                    user_transcript: response.user_transcript.as_deref(),
+                    text: &response.text,
+                    stream: Some(InterleavedTraceStreamSummary {
+                        saw_stream_event: stream_summary.saw_stream_event,
+                        sent_audio: stream_summary.sent_audio,
+                        chunk_count: stream_summary.chunk_count,
+                        audio_samples: stream_summary.audio_samples,
+                        first_frame_elapsed_ms: stream_summary.first_frame_elapsed_ms,
+                        first_decode_elapsed_ms: stream_summary.first_decode_elapsed_ms,
+                        first_detokenizer_wait_ms: stream_summary.first_detokenizer_wait_ms,
+                        max_frame_gap_ms: stream_summary.max_frame_gap_ms,
+                        max_decode_elapsed_ms: stream_summary.max_decode_elapsed_ms,
+                        max_detokenizer_wait_ms: stream_summary.max_detokenizer_wait_ms,
+                        max_queue_wait_ms: stream_summary.max_queue_wait_ms,
+                    }),
+                },
+            );
             send_ws_json(socket, &ServerWsMessage::Status { phase: "listening" }).await?;
             Ok(())
         }
@@ -1534,6 +2035,7 @@ async fn handle_client_message(
             reply_rx
                 .await
                 .map_err(|_| ApiError::internal("session reset reply dropped"))??;
+            log_interleaved_event(state, session_id, InterleavedTracePayload::SessionReset);
             send_ws_json(socket, &ServerWsMessage::SessionReset).await?;
             send_ws_json(socket, &ServerWsMessage::Status { phase: "listening" }).await?;
             Ok(())
@@ -1581,6 +2083,16 @@ async fn send_assistant_turn(socket: &mut WebSocket, response: &AssistantTurn) -
     .await?;
 
     Ok(())
+}
+
+fn log_interleaved_event<'a>(
+    state: &AppState,
+    session_id: u64,
+    payload: InterleavedTracePayload<'a>,
+) {
+    if let Some(logger) = &state.interleaved_trace {
+        logger.log(session_id, payload);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1663,6 +2175,7 @@ struct QueuedAudioChunk {
     frame_elapsed_ms: u64,
     frame_gap_ms: u64,
     decode_elapsed_ms: u64,
+    detokenizer_wait_ms: u64,
     backend: &'static str,
     produced_at: Instant,
 }
@@ -1678,15 +2191,31 @@ fn chunk_playback_duration(chunk_samples: usize) -> Duration {
     Duration::from_secs_f64(seconds)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamingAssistantSummary {
+    saw_stream_event: bool,
+    sent_audio: bool,
+    chunk_count: usize,
+    audio_samples: usize,
+    first_frame_elapsed_ms: Option<u64>,
+    first_decode_elapsed_ms: Option<u64>,
+    first_detokenizer_wait_ms: Option<u64>,
+    max_frame_gap_ms: u64,
+    max_decode_elapsed_ms: u64,
+    max_detokenizer_wait_ms: u64,
+    max_queue_wait_ms: u64,
+}
+
 async fn send_streaming_assistant_events(
     socket: &mut WebSocket,
     stream_rx: &mut mpsc::Receiver<AssistantStreamEvent>,
-) -> ApiResult<bool> {
+) -> ApiResult<StreamingAssistantSummary> {
     let mut sent_audio_start = false;
     let mut saw_event = false;
     let mut stream_closed = false;
     let mut audio_queue = VecDeque::new();
     let mut pacer = AudioOutputPacer::new(OutputQueueConfig::new(STREAM_OUTPUT_QUEUE_CHUNKS));
+    let mut summary = StreamingAssistantSummary::default();
 
     loop {
         if stream_closed && audio_queue.is_empty() {
@@ -1708,6 +2237,7 @@ async fn send_streaming_assistant_events(
                             )
                             .await?;
                             saw_event = true;
+                            summary.saw_stream_event = true;
                         }
 
                         match event {
@@ -1721,6 +2251,7 @@ async fn send_streaming_assistant_events(
                                 frame_elapsed_ms,
                                 frame_gap_ms,
                                 decode_elapsed_ms,
+                                detokenizer_wait_ms,
                                 backend,
                                 produced_at,
                             } => {
@@ -1731,6 +2262,7 @@ async fn send_streaming_assistant_events(
                                     frame_elapsed_ms,
                                     frame_gap_ms,
                                     decode_elapsed_ms,
+                                    detokenizer_wait_ms,
                                     backend,
                                     produced_at,
                                 });
@@ -1770,6 +2302,7 @@ async fn send_streaming_assistant_events(
                             frame_elapsed_ms: chunk.frame_elapsed_ms,
                             frame_gap_ms: chunk.frame_gap_ms,
                             decode_elapsed_ms: chunk.decode_elapsed_ms,
+                            detokenizer_wait_ms: chunk.detokenizer_wait_ms,
                             queue_wait_ms,
                             chunk_samples,
                             backend: chunk.backend,
@@ -1780,8 +2313,27 @@ async fn send_streaming_assistant_events(
                         .send(Message::Binary(chunk.bytes.into()))
                         .await
                         .map_err(|err| ApiError::internal(err.to_string()))?;
+                    summary.sent_audio = true;
+                    summary.chunk_count += 1;
+                    summary.audio_samples += chunk_samples;
+                    summary.first_frame_elapsed_ms
+                        .get_or_insert(chunk.frame_elapsed_ms);
+                    summary.first_decode_elapsed_ms
+                        .get_or_insert(chunk.decode_elapsed_ms);
+                    summary.first_detokenizer_wait_ms
+                        .get_or_insert(chunk.detokenizer_wait_ms);
+                    summary.max_frame_gap_ms = summary.max_frame_gap_ms.max(chunk.frame_gap_ms);
+                    summary.max_decode_elapsed_ms =
+                        summary.max_decode_elapsed_ms.max(chunk.decode_elapsed_ms);
+                    summary.max_detokenizer_wait_ms = summary
+                        .max_detokenizer_wait_ms
+                        .max(chunk.detokenizer_wait_ms);
+                    summary.max_queue_wait_ms =
+                        summary.max_queue_wait_ms.max(queue_wait_ms);
                     info!(
                         chunk_index = chunk.chunk_index,
+                        decode_elapsed_ms = chunk.decode_elapsed_ms,
+                        detokenizer_wait_ms = chunk.detokenizer_wait_ms,
                         queue_wait_ms,
                         ws_send_ms = send_started_at.elapsed().as_millis() as u64,
                         output_queue_chunks = audio_queue.len(),
@@ -1797,7 +2349,7 @@ async fn send_streaming_assistant_events(
         send_ws_json(socket, &ServerWsMessage::AssistantAudioEnd).await?;
     }
 
-    Ok(saw_event)
+    Ok(summary)
 }
 
 async fn send_ws_json<T: Serialize>(socket: &mut WebSocket, payload: &T) -> ApiResult<()> {
@@ -1808,6 +2360,110 @@ async fn send_ws_json<T: Serialize>(socket: &mut WebSocket, payload: &T) -> ApiR
         .send(Message::Text(text.into()))
         .await
         .map_err(|err| ApiError::internal(err.to_string()))
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct FakeDetokenizerRecorder {
+    state: Arc<std::sync::Mutex<FakeDetokenizerState>>,
+}
+
+#[cfg(test)]
+impl FakeDetokenizerRecorder {
+    fn submitted_window_frames(&self) -> Vec<usize> {
+        self.state
+            .lock()
+            .expect("fake detokenizer state should lock")
+            .submitted_window_frames
+            .clone()
+    }
+
+    fn complete_next(&self, completion: DetokenizeCompletion) {
+        self.state
+            .lock()
+            .expect("fake detokenizer state should lock")
+            .ready_results
+            .push_back(Ok(completion));
+    }
+
+    fn set_blocking_waveform_len(&self, waveform_len: usize) {
+        self.state
+            .lock()
+            .expect("fake detokenizer state should lock")
+            .blocking_waveform_len = Some(waveform_len);
+    }
+}
+
+#[cfg(test)]
+struct FakeDetokenizerClient {
+    state: Arc<std::sync::Mutex<FakeDetokenizerState>>,
+}
+
+#[cfg(test)]
+impl FakeDetokenizerClient {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(FakeDetokenizerState::default())),
+        }
+    }
+
+    fn recorder(&self) -> FakeDetokenizerRecorder {
+        FakeDetokenizerRecorder {
+            state: self.state.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl DetokenizerClient for FakeDetokenizerClient {
+    fn submit(&mut self, request: DetokenizeRequest) -> ApiResult<()> {
+        let mut state = self.state.lock().expect("fake detokenizer state should lock");
+        state.submitted_window_frames.push(request.codes.len());
+        state.pending_requests.push_back((request.decode_index, request.codes.len()));
+        Ok(())
+    }
+
+    fn try_complete(&mut self) -> ApiResult<Option<DetokenizeCompletion>> {
+        let mut state = self.state.lock().expect("fake detokenizer state should lock");
+        let Some(result) = state.ready_results.pop_front() else {
+            return Ok(None);
+        };
+        state.pending_requests.pop_front();
+        result.map(Some)
+    }
+
+    fn recv_complete(&mut self) -> ApiResult<DetokenizeCompletion> {
+        let mut state = self.state.lock().expect("fake detokenizer state should lock");
+        if let Some(result) = state.ready_results.pop_front() {
+            state.pending_requests.pop_front();
+            return result;
+        }
+
+        let (decode_index, window_frames) = state
+            .pending_requests
+            .pop_front()
+            .ok_or_else(|| ApiError::internal("fake detokenizer had no pending request"))?;
+        let waveform_len = state
+            .blocking_waveform_len
+            .take()
+            .unwrap_or(window_frames * STREAM_SAMPLES_PER_FRAME);
+        Ok(DetokenizeCompletion {
+            decode_index,
+            waveform: vec![0.0; waveform_len],
+            decode_elapsed_ms: 0,
+            detokenizer_wait_ms: 0,
+            backend: "onnx",
+        })
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FakeDetokenizerState {
+    submitted_window_frames: Vec<usize>,
+    pending_requests: VecDeque<(usize, usize)>,
+    ready_results: VecDeque<DetokenizeResult>,
+    blocking_waveform_len: Option<usize>,
 }
 
 fn validate_wav_content_type(headers: &HeaderMap) -> ApiResult<()> {
@@ -1882,9 +2538,10 @@ fn resolve_tts_system_prompt(system_prompt: Option<&str>, voice: Option<&str>) -
 mod tests {
     use super::{
         background_worker_index, chunk_playback_duration, effective_worker_count,
-        parse_device_preference, split_new_waveform_tail, STREAM_DECODE_BATCH_FRAMES,
-        STREAM_DECODE_CONTEXT_FRAMES, STREAM_OUTPUT_QUEUE_CHUNKS, AudioOutputPacer,
-        Device, DevicePreference, OutputQueueConfig, StreamingAudioDecoder,
+        parse_device_preference, split_new_waveform_tail, DetokenizeCompletion,
+        Device, DevicePreference, FakeDetokenizerClient, OutputQueueConfig,
+        STREAM_DECODE_BATCH_FRAMES, STREAM_DECODE_CONTEXT_FRAMES, STREAM_OUTPUT_QUEUE_CHUNKS,
+        StreamingAudioDecoder, AudioOutputPacer, spawn_detokenizer_worker,
     };
     use lfm2_audio::{LFM2Audio, Precision, TTSOptions};
     use std::path::PathBuf;
@@ -2001,6 +2658,107 @@ mod tests {
         assert_eq!(next_emitted_samples, 15_360);
     }
 
+    #[test]
+    fn streaming_audio_decoder_keeps_one_decode_in_flight_until_ready_chunk_is_drained() {
+        let client = FakeDetokenizerClient::new();
+        let recorder = client.recorder();
+        let mut decoder = StreamingAudioDecoder::new_with_client(
+            Box::new(client),
+            super::StreamingDecodeConfig::new(2, 2),
+            7,
+        );
+
+        assert!(decoder.push_frame([1; 8]).expect("push should succeed").is_none());
+        assert!(decoder.push_frame([2; 8]).expect("push should succeed").is_none());
+        assert_eq!(recorder.submitted_window_frames(), vec![2]);
+
+        assert!(decoder.push_frame([3; 8]).expect("push should succeed").is_none());
+        assert_eq!(
+            recorder.submitted_window_frames(),
+            vec![2],
+            "decoder must not submit a second job while the first is still in flight"
+        );
+
+        recorder.complete_next(DetokenizeCompletion::from_waveform(
+            1,
+            vec![0.0; 3_840],
+            11,
+            4,
+            "onnx",
+        ));
+
+        let ready = decoder.drain_ready().expect("drain should succeed");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].emitted_samples, 3_840);
+        assert_eq!(ready[0].detokenizer_wait_ms, 4);
+
+        assert!(decoder.push_frame([4; 8]).expect("push should succeed").is_none());
+        assert_eq!(recorder.submitted_window_frames(), vec![2, 4]);
+    }
+
+    #[test]
+    fn streaming_audio_decoder_finish_drains_inflight_and_final_pending_frames() {
+        let client = FakeDetokenizerClient::new();
+        let recorder = client.recorder();
+        let mut decoder = StreamingAudioDecoder::new_with_client(
+            Box::new(client),
+            super::StreamingDecodeConfig::new(2, 0),
+            9,
+        );
+
+        assert!(decoder.push_frame([1; 8]).expect("push should succeed").is_none());
+        assert!(decoder.push_frame([2; 8]).expect("push should succeed").is_none());
+        assert!(decoder.push_frame([3; 8]).expect("push should succeed").is_none());
+        assert_eq!(recorder.submitted_window_frames(), vec![2]);
+
+        recorder.complete_next(DetokenizeCompletion::from_waveform(
+            1,
+            vec![0.0; 3_840],
+            9,
+            2,
+            "onnx",
+        ));
+        recorder.set_blocking_waveform_len(1_920);
+
+        let drained = decoder.finish().expect("finish should succeed");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].emitted_samples, 3_840);
+        assert_eq!(drained[1].emitted_samples, 1_920);
+        assert_eq!(recorder.submitted_window_frames(), vec![2, 1]);
+    }
+
+    #[test]
+    fn streaming_audio_decoder_limits_zero_context_backlog_to_one_batch() {
+        let client = FakeDetokenizerClient::new();
+        let recorder = client.recorder();
+        let mut decoder = StreamingAudioDecoder::new_with_client(
+            Box::new(client),
+            super::StreamingDecodeConfig::new(2, 0),
+            11,
+        );
+
+        assert!(decoder.push_frame([1; 8]).expect("push should succeed").is_none());
+        assert!(decoder.push_frame([2; 8]).expect("push should succeed").is_none());
+        assert!(decoder.push_frame([3; 8]).expect("push should succeed").is_none());
+
+        recorder.complete_next(DetokenizeCompletion::from_waveform(
+            1,
+            vec![0.0; 3_840],
+            6,
+            1,
+            "onnx",
+        ));
+
+        let ready = decoder.push_frame([4; 8]).expect("push should succeed");
+        assert!(ready.is_some(), "pushing the next batch should surface the completed prior batch");
+
+        assert_eq!(
+            recorder.submitted_window_frames(),
+            vec![2, 2],
+            "zero-context streaming should only allow one batch of decode backlog"
+        );
+    }
+
     fn get_model_path() -> Option<PathBuf> {
         let candidates = [
             PathBuf::from("tests/models/LFM2.5-Audio-1.5B-ONNX"),
@@ -2038,23 +2796,28 @@ mod tests {
         );
         let audio_codes: Vec<[u16; 8]> = debug.audio_codes.iter().take(8).copied().collect();
 
+        let detokenizer = spawn_detokenizer_worker(
+            get_model_path().expect("model path should exist"),
+            Precision::Q4,
+            Device::CPU,
+            99,
+        )
+        .expect("dedicated detokenizer worker should load");
         let mut decoder = StreamingAudioDecoder::new(
-            &model,
+            detokenizer,
             super::StreamingDecodeConfig::new(4, 16),
             0,
         )
         .expect("ONNX streaming decoder should load");
         let mut streamed_bytes = Vec::new();
         for frame in &audio_codes {
-            if let Some(chunk) = decoder
-                .push_frame(*frame)
-                .expect("push_frame should succeed")
-            {
+            decoder.push_frame(*frame).expect("push_frame should succeed");
+            for chunk in decoder.drain_ready().expect("drain_ready should succeed") {
                 streamed_bytes.extend_from_slice(&chunk.bytes);
             }
         }
 
-        if let Some(chunk) = decoder.finish().expect("finish should succeed") {
+        for chunk in decoder.finish().expect("finish should succeed") {
             streamed_bytes.extend_from_slice(&chunk.bytes);
         }
 

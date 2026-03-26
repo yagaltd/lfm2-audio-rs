@@ -1,226 +1,217 @@
 # LFM2-Audio-RS
 
-Rust implementation of [LFM2.5-Audio-1.5B](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX) multimodal speech model supporting ASR, TTS, and interleaved audio-text generation.
+Rust bindings and demo server for Liquid AI's [`LFM2.5-Audio-1.5B-ONNX`](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX) model, using [ONNX Runtime](https://onnxruntime.ai/) through the Rust [`ort`] crate.
 
-## Features
+This repo is built around the ONNX export, not the original PyTorch checkpoints. In practice the default path here is:
 
-- **ASR (Automatic Speech Recognition)**: Audio → Text
-- **TTS (Text-to-Speech)**: Text → Audio with voice control
-- **Interleaved**: Audio ↔ Text + Audio (speech-to-speech)
-- **Multi-turn Chat**: Persistent conversation with KV-cache
+- model: `LFM2.5-Audio-1.5B-ONNX`
+- runtime: ONNX Runtime via Rust `ort`
+- precision: `q4`
+- default CPU path: sequential ASR and sequential TTS
 
-## Model Requirements
+## What Works Well
 
-Download the ONNX model from HuggingFace:
+- ASR: audio to text
+- TTS: text to audio
+- Interleaved chat: text/audio input with text+audio output
+- Browser demo server for websocket interleaved chat and HTTP ASR/TTS
 
-```bash
-mkdir -p models/LFM2.5-Audio-1.5B-ONNX
-cd models/LFM2.5-Audio-1.5B-ONNX
+## Practical Guidance
 
-# Download config and tokenizer
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/config.json
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/tokenizer.json
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/tokenizer_config.json
+- Use `q4` unless you have a strong reason not to.
+- On CPU, sequential ASR and sequential TTS are the recommended paths.
+- Interleaved mode works, but CPU realtime speech-to-speech is still not smooth enough. It can sound choppy under load.
+- On GPU, interleaved mode is the path that makes the most sense to push further.
 
-# Download ONNX models (Q4 recommended for most uses)
-mkdir -p onnx
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/onnx/audio_encoder_q4.onnx
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/onnx/decoder_q4.onnx
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/onnx/vocoder_depthformer_q4.onnx
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/onnx/audio_detokenizer_q4.onnx
+## Model Files
 
-# Download embedding binaries
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/onnx/embed_tokens.bin
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/onnx/embed_tokens.json
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/onnx/audio_embedding.bin
-wget https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX/resolve/main/onnx/audio_embedding.json
+Download the Liquid AI ONNX package and place it under a model directory such as:
 
-# Download external data files if they exist (for models > 2GB)
-# Check the HuggingFace repo for .onnx_data files
+```text
+models/LFM2.5-Audio-1.5B-ONNX/
+  config.json
+  tokenizer.json
+  tokenizer_config.json
+  onnx/
+    audio_encoder_q4.onnx
+    decoder_q4.onnx
+    vocoder_depthformer_q4.onnx
+    audio_detokenizer_q4.onnx
+    embed_tokens.bin
+    embed_tokens.json
+    audio_embedding.bin
+    audio_embedding.json
+    *.onnx_data
 ```
 
-## Installation
+Important:
 
-### From Source
+- `.onnx` contains the graph.
+- `.onnx_data` contains external weights for large ONNX models.
+- This crate expects the Liquid AI ONNX export layout, including the embedding binaries.
+
+## Build
 
 ```bash
-git clone https://github.com/yourusername/lfm2-audio-rs.git
-cd lfm2-audio-rs
-
-# CPU only
 cargo build --release
+```
 
-# With CUDA
+Optional accelerators:
+
+```bash
 cargo build --release --features cuda
-
-# With CoreML (macOS)
 cargo build --release --features coreml
 ```
 
-Binaries will be in `target/release/`.
+## Sequential Mode
 
-## Usage
+Sequential mode means using the dedicated ASR and TTS pipelines directly instead of the interleaved chat pipeline.
 
-### CLI
-
-#### ASR (Transcription)
-
-```bash
-# Basic transcription
-./lfm2-audio --model ./models/LFM2.5-Audio-1.5B-ONNX asr input.wav
-
-# With options
-./lfm2-audio \
-  --model ./models/LFM2.5-Audio-1.5B-ONNX \
-  --precision q4 \
-  --device cpu \
-  asr input.wav \
-  --output transcript.txt \
-  --system-prompt "Transcribe this audio accurately."
-```
-
-#### TTS (Synthesis)
-
-```bash
-# Basic synthesis
-./lfm2-audio --model ./models/LFM2.5-Audio-1.5B-ONNX tts "Hello, world!"
-
-# With voice selection
-./lfm2-audio \
-  --model ./models/LFM2.5-Audio-1.5B-ONNX \
-  tts "Hello, world!" \
-  --voice "Use the UK female voice." \
-  --output hello.wav \
-  --audio-temp 0.8
-```
-
-#### Show Model Info
-
-```bash
-./lfm2-audio --model ./models/LFM2.5-Audio-1.5B-ONNX info
-```
-
-### Library
+### Library: ASR
 
 ```rust
-use lfm2_audio::{LFM2Audio, Precision, Device, ASROptions, TTSOptions};
+use lfm2_audio::{ASROptions, Device, LFM2Audio, Precision};
 
 fn main() -> anyhow::Result<()> {
-    // Load model
     let model = LFM2Audio::from_pretrained(
         "./models/LFM2.5-Audio-1.5B-ONNX",
         Precision::Q4,
         Device::CPU,
     )?;
 
-    // ASR
     let (audio, spec) = lfm2_audio::load_audio("input.wav")?;
-    let text = model.asr().transcribe(&audio, spec.sample_rate, &ASROptions::default())?;
-    println!("Transcription: {}", text);
+    let text = model
+        .asr()
+        .transcribe(&audio, spec.sample_rate, &ASROptions::default())?;
 
-    // TTS
-    let options = TTSOptions::default()
-        .with_system_prompt("Use the UK female voice.");
-    let speech = model.tts().synthesize("Hello, world!", &options)?;
-    lfm2_audio::save_audio("output.wav", &speech, 24000)?;
-
+    println!("{}", text);
     Ok(())
 }
 ```
 
-### API Server
+### Library: TTS
+
+```rust
+use lfm2_audio::{Device, LFM2Audio, Precision, TTSOptions};
+
+fn main() -> anyhow::Result<()> {
+    let model = LFM2Audio::from_pretrained(
+        "./models/LFM2.5-Audio-1.5B-ONNX",
+        Precision::Q4,
+        Device::CPU,
+    )?;
+
+    let options = TTSOptions::default()
+        .with_system_prompt("Use the UK female voice.");
+    let audio = model.tts().synthesize("Hello from Rust.", &options)?;
+    lfm2_audio::save_audio("output.wav", &audio, 24_000)?;
+    Ok(())
+}
+```
+
+### Server: ASR
 
 ```bash
-# Start server
-./lfm2-server ./models/LFM2.5-Audio-1.5B-ONNX --port 8080
+./target/release/lfm2-server ./models/LFM2.5-Audio-1.5B-ONNX --port 8080
 
-# Transcribe
-curl -X POST http://localhost:8080/v1/audio/transcriptions \
+curl -X POST http://127.0.0.1:8080/api/asr \
+  -H "Content-Type: audio/wav" \
+  --data-binary @input.wav
+```
+
+### Server: TTS
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/tts \
   -H "Content-Type: application/json" \
   -d '{
-    "file": "<base64-audio>",
-    "model": "lfm2.5-audio"
-  }'
-
-# Synthesize
-curl -X POST http://localhost:8080/v1/audio/speech \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "lfm2.5-audio",
-    "input": "Hello, world!",
-    "voice": "alloy"
+    "text": "Hello from the sequential TTS route.",
+    "voice": "Use the UK female voice."
   }' \
   --output speech.wav
 ```
 
+## Interleaved Mode
+
+Interleaved mode keeps a persistent chat session with decoder KV cache and emits text updates plus audio chunks over the websocket route:
+
+```text
+/ws/interleaved
+```
+
+This is the speech-to-speech / multimodal chat path. It is the most expensive mode in the repo.
+
+Current guidance:
+
+- CPU: functional, but not smooth enough for true realtime speech-to-speech
+- GPU: preferred if you want to keep pushing interleaved UX
+
+## Lag Debugging
+
+The demo server can write an opt-in NDJSON trace for interleaved sessions:
+
+```bash
+./target/release/lfm2-server \
+  ./models/LFM2.5-Audio-1.5B-ONNX \
+  --interleaved-log ./logs/interleaved.ndjson
+```
+
+Or with env:
+
+```bash
+LFM2_INTERLEAVED_LOG_PATH=./logs/interleaved.ndjson ./target/release/lfm2-server ./models/LFM2.5-Audio-1.5B-ONNX
+```
+
+The trace captures:
+
+- session start/reset/close
+- user text turns
+- user audio turn metadata
+- final assistant text
+- interleaved stream timing summary:
+  first frame
+  first decode
+  detokenizer wait
+  frame-gap spikes
+  queue wait
+
+This is meant to explain where interleaved lag comes from without logging raw PCM.
+
+## Browser Demo
+
+The built-in page now exposes three paths:
+
+- interleaved websocket chat
+- sequential ASR file transcription
+- sequential TTS from typed text
+
+That split is intentional. Sequential ASR/TTS are the more realistic CPU workflows today.
+
 ## Architecture
 
-```
-LFM2.5-Audio Model
-├── Audio Encoder (Conformer)
-│   └── Mel Spectrogram → Audio Embeddings
-├── LFM2 Decoder (1.2B params, 16 layers)
-│   ├── Conv layers with cache
-│   └── Attention layers with KV-cache
-├── Depthformer (6 layers)
-│   └── Autoregressive codebook prediction
-└── Audio Detokenizer
-    └── Codes → STFT → Waveform (24kHz)
+```text
+Audio encoder          : audio -> embeddings
+Decoder                : main autoregressive LFM2 backbone
+Depthformer            : autoregressive audio codebook prediction
+Audio detokenizer      : audio codes -> waveform
+Binary embeddings      : text/audio embedding lookup when available
+ONNX Runtime sessions  : execution backend through Rust ort
 ```
 
-## Performance
+## API Surface
 
-Expected performance on modern hardware (Q4 precision):
+- `LFM2Audio::asr()` for sequential transcription
+- `LFM2Audio::tts()` for sequential synthesis
+- `LFM2Audio::interleaved()` and chat session APIs for multimodal/interleaved generation
+- `POST /api/asr` and `POST /v1/audio/transcriptions`
+- `POST /api/tts` and `POST /v1/audio/speech`
+- `GET /ws/interleaved`
 
-| Task | RTF (lower is better) | Notes |
-|------|----------------------|-------|
-| ASR | ~0.5-1.0x | Real-time capable |
-| TTS | ~1.0-2.0x | Depends on length |
+## Notes
 
-RTF = Real-Time Factor (processing time / audio duration)
-
-## Project Structure
-
-```
-src/
-├── lib.rs           # Public API
-├── model.rs         # Main LFM2Audio struct
-├── asr.rs           # ASR pipeline
-├── tts.rs           # TTS pipeline
-├── interleaved.rs   # Speech-to-speech
-├── chat.rs          # Multi-turn chat
-├── cache.rs         # KV-cache management
-├── sessions.rs      # ONNX session loading
-├── embeddings.rs    # Binary embedding loaders
-├── tokenizer.rs     # Tokenizer wrapper
-├── config.rs        # Model configuration
-├── error.rs         # Error types
-└── audio/
-    ├── mod.rs       # Audio I/O
-    ├── mel.rs       # Mel spectrogram
-    └── istft.rs     # Inverse STFT
-```
-
-## Implementation Status
-
-- [x] Model loading (ONNX sessions + binary embeddings)
-- [x] Mel spectrogram computation
-- [x] ISTFT for audio detokenization
-- [x] KV-cache management
-- [x] ASR pipeline (partial)
-- [ ] ASR pipeline (complete with full cache handling)
-- [ ] TTS pipeline (complete)
-- [ ] Depthformer integration
-- [ ] Audio detokenizer integration
-- [ ] Interleaved mode
-- [ ] Chat sessions
-- [ ] API server
-
-## References
-
-- [LFM2.5-Audio-1.5B](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-ONNX) - Original model
-- [Liquid AI Cookbook](https://github.com/Liquid4All/onnx-export) - Python reference implementation
-- [ONNX Runtime](https://onnxruntime.ai/) - Inference engine
+- The server keeps model sessions resident.
+- Interleaved chat sessions preserve history through the persistent decoder cache until reset or socket close.
+- There is currently no automatic session history trimming in interleaved chat.
 
 ## License
 

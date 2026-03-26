@@ -58,3 +58,47 @@ test("assistant player starts playback as soon as the first chunk arrives", () =
   assert.equal(processor.port.messages[0].reason, "playback-started");
   assert.equal(processor.port.messages[0].queued_samples, 1920);
 });
+
+test("assistant player buffers a too-small first chunk until threshold is met", () => {
+  const Processor = loadProcessorClass();
+  const processor = new Processor();
+
+  enqueue(processor, 64);
+
+  assert.equal(processor.started, false);
+  assert.equal(processor.port.messages.length, 0);
+
+  enqueue(processor, 64);
+
+  assert.equal(processor.started, true);
+  assert.equal(processor.port.messages.length, 1);
+  assert.equal(processor.port.messages[0].reason, "playback-started");
+  assert.equal(processor.port.messages[0].queued_samples, 128);
+});
+
+test("assistant player waits for a small refill before resuming after underrun", () => {
+  const Processor = loadProcessorClass();
+  const processor = new Processor();
+  const output = [new Float32Array(128)];
+
+  enqueue(processor, 128);
+  assert.equal(processor.started, true);
+
+  processor.process([], [output], {});
+  processor.process([], [output], {});
+
+  assert.equal(processor.underruns, 1);
+  assert.equal(processor.inUnderrun, true);
+
+  enqueue(processor, 64);
+  assert.equal(processor.started, false);
+  assert.equal(processor.inUnderrun, true);
+
+  enqueue(processor, 64);
+  assert.equal(processor.started, true);
+  assert.equal(processor.inUnderrun, false);
+
+  const resumeMessage = processor.port.messages.at(-1);
+  assert.equal(resumeMessage.reason, "playback-resumed");
+  assert.equal(resumeMessage.queued_samples, 128);
+});

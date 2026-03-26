@@ -17,8 +17,15 @@ const resetSessionButton = document.getElementById("resetSession");
 const startMicButton = document.getElementById("startMic");
 const stopMicButton = document.getElementById("stopMic");
 const sendTextButton = document.getElementById("sendText");
+const synthesizeTextButton = document.getElementById("synthesizeText");
+const synthesizePanelTextButton = document.getElementById("synthesizePanelText");
 const textInput = document.getElementById("textInput");
 const systemPromptInput = document.getElementById("systemPrompt");
+const asrFileInput = document.getElementById("asrFile");
+const asrPromptInput = document.getElementById("asrPrompt");
+const transcribeFileButton = document.getElementById("transcribeFile");
+const asrResult = document.getElementById("asrResult");
+const ttsVoicePromptInput = document.getElementById("ttsVoicePrompt");
 const vadThresholdInput = document.getElementById("vadThreshold");
 const vadThresholdValue = document.getElementById("vadThresholdValue");
 const silenceTimeoutInput = document.getElementById("silenceTimeout");
@@ -30,6 +37,7 @@ const vadMeter = document.getElementById("vadMeter");
 const feed = document.getElementById("feed");
 const logEl = document.getElementById("log");
 const assistantAudio = document.getElementById("assistantAudio");
+const ttsAudio = document.getElementById("ttsAudio");
 
 let ws = null;
 let audioContext = null;
@@ -156,6 +164,16 @@ function createWavBlobFromInt16(samples, sampleRate) {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
+function setAudioElementSource(audioEl, blob) {
+  const previousUrl = audioEl.dataset.objectUrl;
+  if (previousUrl) {
+    URL.revokeObjectURL(previousUrl);
+  }
+  const nextUrl = URL.createObjectURL(blob);
+  audioEl.dataset.objectUrl = nextUrl;
+  audioEl.src = nextUrl;
+}
+
 async function ensureAssistantPlayback() {
   if (assistantPlaybackNode && assistantPlaybackContext) {
     return;
@@ -177,6 +195,13 @@ async function ensureAssistantPlayback() {
     if (event.data.reason === "playback-started") {
       log(
         `Assistant playback started (${samplesToMs(event.data.queued_samples)}ms queued)`,
+      );
+      return;
+    }
+
+    if (event.data.reason === "playback-resumed") {
+      log(
+        `Assistant playback resumed (${samplesToMs(event.data.queued_samples)}ms queued, underruns=${event.data.underruns})`,
       );
       return;
     }
@@ -447,7 +472,7 @@ function handleServerJson(message) {
       if (assistantStreamingAudio && assistantPcmChunks.length > 0) {
         const pcm = binaryToInt16Array(assistantPcmChunks.map((chunk) => chunk.buffer));
         const blob = createWavBlobFromInt16(pcm, ASSISTANT_SAMPLE_RATE);
-        assistantAudio.src = URL.createObjectURL(blob);
+        setAudioElementSource(assistantAudio, blob);
         log(`Received assistant audio (${blob.size} bytes)`);
         if (assistantStreamMetrics) {
           const firstChunkLatency =
@@ -629,6 +654,77 @@ function sendTextTurn() {
   setPhase("Processing");
 }
 
+async function transcribeSelectedFile() {
+  const file = asrFileInput.files?.[0];
+  if (!file) {
+    log("Choose a WAV file first");
+    return;
+  }
+
+  transcribeFileButton.disabled = true;
+  asrResult.textContent = "Transcribing...";
+  try {
+    const headers = {};
+    if (asrPromptInput.value.trim()) {
+      headers["x-system-prompt"] = asrPromptInput.value.trim();
+    }
+    if (file.type) {
+      headers["Content-Type"] = file.type;
+    }
+    const response = await fetch("/api/asr", {
+      method: "POST",
+      headers,
+      body: file,
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    const payload = await response.json();
+    asrResult.textContent =
+      `${payload.text}\n\nSample rate: ${payload.sample_rate} Hz\nDuration: ${payload.duration_ms} ms`;
+    log(`ASR complete (${payload.duration_ms}ms audio)`);
+  } catch (error) {
+    asrResult.textContent = `ASR failed: ${error.message}`;
+    log(`ASR failed: ${error.message}`);
+  } finally {
+    transcribeFileButton.disabled = false;
+  }
+}
+
+async function synthesizeTypedText() {
+  const text = textInput.value.trim();
+  if (!text) {
+    log("Type some text to synthesize first");
+    return;
+  }
+
+  synthesizeTextButton.disabled = true;
+  synthesizePanelTextButton.disabled = true;
+  try {
+    const response = await fetch("/api/tts", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text,
+        voice: ttsVoicePromptInput.value.trim() || undefined,
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    const blob = await response.blob();
+    setAudioElementSource(ttsAudio, blob);
+    log(`TTS complete (${blob.size} bytes)`);
+  } catch (error) {
+    log(`TTS failed: ${error.message}`);
+  } finally {
+    synthesizeTextButton.disabled = false;
+    synthesizePanelTextButton.disabled = false;
+  }
+}
+
 connectButton.addEventListener("click", connectSocket);
 disconnectButton.addEventListener("click", () => {
   stopMic();
@@ -650,8 +746,24 @@ startMicButton.addEventListener("click", async () => {
 });
 stopMicButton.addEventListener("click", stopMic);
 sendTextButton.addEventListener("click", sendTextTurn);
+synthesizeTextButton.addEventListener("click", () => {
+  synthesizeTypedText().catch((error) => {
+    log(`TTS failed: ${error.message}`);
+  });
+});
+synthesizePanelTextButton.addEventListener("click", () => {
+  synthesizeTypedText().catch((error) => {
+    log(`TTS failed: ${error.message}`);
+  });
+});
+transcribeFileButton.addEventListener("click", () => {
+  transcribeSelectedFile().catch((error) => {
+    asrResult.textContent = `ASR failed: ${error.message}`;
+    log(`ASR failed: ${error.message}`);
+  });
+});
 textInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
+  if (event.key === "Enter" && !event.shiftKey) {
     sendTextTurn();
   }
 });

@@ -67,10 +67,15 @@ The script:
 - **Keep:** reduce default streaming decode context from 16 frames to 0 frames. Result: `realtime_penalty_ms=1047`, `first_playable_audio_ms=769`, `max_chunk_deficit_ms=285`, `total_turn_ms=13324`, holdout penalty `1057`. This recovered throughput while keeping overlap at zero.
 - **Keep:** start output pacing after 1 chunk instead of 2. Result: `realtime_penalty_ms=784`, `first_playable_audio_ms=530`, `max_chunk_deficit_ms=284`, holdout penalty `776`, and server-side queue wait collapsed to ~1ms. This is the best result so far, though `total_turn_ms` rose to ~22s and chunk count rose to 85 on the tune suite.
 - **Crash/Discard insight:** a 1-frame batch improved startup further (~0.6s first playable) but exploded chunk count enough that the tune suite stopped completing reliably under the harness.
+- **Discard:** larger batch sizes (`batch=3`) reduced chunk count but regressed startup and holdout smoothness.
+- **Discard:** interleaving overrides (`n_text=1`, `n_text=3`, `n_audio=24`) can improve first-audio timing but create worse starvation, extreme chunk counts, or catastrophic total-turn time. They are not safe realtime levers here.
+- **Discard:** an output-pacer catch-up tweak behaved correctly in isolation but did not beat the simpler current pacer on end-to-end websocket runs.
+- **Discard:** async detokenization prototypes were not competitive. Single-frame async output caused severe starvation even after fixing a final-drain bug; batched async output also regressed badly.
+- **Discard:** lowering ONNX intra-op threads from 8 to 4 clearly hurt startup and deficit.
 - After the tail fix, context retention turned out to be the biggest remaining CPU cost; after removing it, startup buffering became the next major lever.
-- The remaining pain is now the residual ~260–284ms chunk deficit. That suggests the next wins are likely structural rather than more constant tuning.
+- The remaining pain is now the residual ~260–284ms chunk deficit under the current best config. The most plausible next wins appear to be either more sophisticated decode parallelism that preserves current chunk semantics, or client-side smoothing work that better matches what users actually hear.
 
 ## Current Hypotheses
-1. The biggest remaining gain is now likely in asynchronous or decoupled decode work, not another simple constant change.
-2. A millisecond-based pacer may still help slightly, but startup queue wait is already near zero with 1-chunk startup.
-3. If the current residual deficit comes from synchronous detokenizer cost on the generation thread, hiding decode behind frame generation is the most promising next path.
+1. The remaining easy server-side constant changes are mostly exhausted; the next real gain is likely structural or client-side.
+2. If async/decode parallelism is revisited, it must preserve the current 2-frame chunk semantics rather than emitting ordered single-frame chunks.
+3. If the websocket path is already near its server-side limit, the next trustworthy improvement path is client-side buffering/smoothing accompanied by a better playback-faithful metric, not benchmark gaming.

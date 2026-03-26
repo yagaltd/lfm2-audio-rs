@@ -12,7 +12,7 @@
       <div>
         <p class="eyebrow">LFM2 Audio</p>
         <h1>Browser mic demo for ASR and interleaved audio replies</h1>
-        <p class="lede">Client-side VAD cuts utterances in the browser. The Rust server keeps the model resident and handles ASR, TTS, and interleaved chat over HTTP and WebSocket.</p>
+        <p class="lede">The browser handles VAD and mic capture. The Rust server keeps the ONNX Runtime model resident and serves sequential ASR/TTS over HTTP plus interleaved chat over WebSocket.</p>
       </div>
       <div class="grid two">
         <label>
@@ -23,8 +23,10 @@
           <span>Typed input</span>
           <div class="row">
             <input id="textInput" type="text" placeholder="Type a message for the assistant">
-            <button id="sendText">Send</button>
+            <button id="sendText">Chat</button>
+            <button id="synthesizeText" class="secondary">Synthesize</button>
           </div>
+          <p class="hint">`Chat` uses the interleaved websocket session. `Synthesize` uses the sequential TTS HTTP route.</p>
         </label>
       </div>
     </section>
@@ -92,6 +94,37 @@
         <h2>Assistant audio</h2>
         <audio id="assistantAudio" controls></audio>
         <pre class="log" id="log"></pre>
+      </div>
+    </section>
+
+    <section class="grid two">
+      <div class="panel">
+        <h2>Sequential ASR</h2>
+        <label>
+          <span>WAV file</span>
+          <input id="asrFile" type="file" accept=".wav,audio/wav,audio/x-wav">
+        </label>
+        <label>
+          <span>Optional ASR system prompt</span>
+          <input id="asrPrompt" type="text" placeholder="Perform ASR.">
+        </label>
+        <div class="row wrap">
+          <button id="transcribeFile">Transcribe File</button>
+        </div>
+        <pre class="feed" id="asrResult"></pre>
+      </div>
+
+      <div class="panel">
+        <h2>Sequential TTS</h2>
+        <label>
+          <span>Voice / system prompt</span>
+          <input id="ttsVoicePrompt" type="text" placeholder="Use the UK female voice.">
+        </label>
+        <div class="row wrap">
+          <button id="synthesizePanelText">Synthesize Typed Text</button>
+        </div>
+        <audio id="ttsAudio" controls></audio>
+        <p class="hint">This uses `/api/tts` and does not depend on the interleaved websocket session.</p>
       </div>
     </section>
 

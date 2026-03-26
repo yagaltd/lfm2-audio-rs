@@ -151,6 +151,11 @@ button {
   transition: transform 140ms ease, opacity 140ms ease, background 140ms ease;
 }
 
+button.secondary {
+  background: rgba(29, 26, 23, 0.08);
+  color: var(--ink);
+}
+
 button:hover:not(:disabled) {
   transform: translateY(-1px);
 }
@@ -205,6 +210,13 @@ button:disabled {
   border-radius: 16px;
   background: rgba(255, 255, 255, 0.7);
   border: 1px solid var(--line);
+}
+
+pre.feed {
+  white-space: pre-wrap;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 13px;
+  margin: 0;
 }
 
 .feed-item {
