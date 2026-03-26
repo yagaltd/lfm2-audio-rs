@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LFM2 Audio Demo</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260325-kitten">
+  <link rel="stylesheet" href="/static/styles.css?v=20260326">
 </head>
 <body>
   <main class="app">
@@ -41,13 +41,6 @@
           <div class="status-pill" id="connectionState">Disconnected</div>
           <div class="status-pill subtle" id="phaseState">Idle</div>
         </div>
-        <label class="toggle compact">
-          <span class="label-with-value">
-            <span>Fast TTS mode (KittenTTS)</span>
-            <input id="fastTtsMode" type="checkbox">
-          </span>
-          <span class="hint">~50ms/frame vs LFM2's ~90ms/frame. Text-only LLM + KittenTTS synthesis.</span>
-        </label>
       </div>
 
       <div class="panel">
@@ -102,43 +95,9 @@
       </div>
     </section>
 
-    <section class="panel">
-      <h2>Standalone TTS <span class="badge">New</span></h2>
-      <p class="hint">Test text-to-speech without interleaved mode. KittenTTS is ~45% faster but doesn't support interleaved generation.</p>
-      <div class="grid three">
-        <label>
-          <span>Text to speak</span>
-          <input id="ttsInput" type="text" placeholder="Enter text to synthesize">
-        </label>
-        <label>
-          <span>Backend</span>
-          <select id="ttsBackend">
-            <option value="lfm2">LFM2 (interleaved-capable, ~90ms/frame)</option>
-            <option value="kitten">KittenTTS (~50ms/frame, 8 voices)</option>
-          </select>
-        </label>
-        <label>
-          <span>Voice (KittenTTS only)</span>
-          <select id="ttsVoice">
-            <option value="Bella">Bella</option>
-            <option value="Jasper">Jasper</option>
-            <option value="Luna">Luna</option>
-            <option value="Bruno">Bruno</option>
-            <option value="Rosie">Rosie</option>
-            <option value="Hugo">Hugo</option>
-            <option value="Kiki">Kiki</option>
-            <option value="Leo">Leo</option>
-          </select>
-        </label>
-      </div>
-      <div class="row wrap">
-        <button id="synthesizeBtn">Synthesize</button>
-        <span id="ttsStatus" class="status-pill subtle"></span>
-      </div>
-      <audio id="ttsAudio" controls></audio>
-    </section>
+
   </main>
 
-  <script type="module" src="/static/app.js?v=20260325-kitten"></script>
+  <script type="module" src="/static/app.js?v=20260326"></script>
 </body>
 </html>

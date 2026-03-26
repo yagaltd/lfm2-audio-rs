@@ -52,11 +52,6 @@ impl<'a> ChatSession<'a> {
         }
     }
 
-    /// Set text-only mode (for external TTS like KittenTTS)
-    pub fn set_text_only(&mut self, text_only: bool) {
-        self.options.text_only = text_only;
-    }
-
     /// Add user audio turn
     pub fn add_user_audio(&mut self, audio: &[f32], sample_rate: u32) -> Result<()> {
         self.add_user_audio_with_text(audio, sample_rate, None)
@@ -104,9 +99,8 @@ impl<'a> ChatSession<'a> {
         mut on_event: Option<&mut dyn FnMut(InterleavedEvent) -> Result<()>>,
     ) -> Result<AssistantResponse> {
         log::info!(
-            "Chat: Generating response for {} turns (text_only={})",
-            self.turns.len(),
-            self.options.text_only
+            "Chat: Generating response for {} turns",
+            self.turns.len()
         );
 
         let include_system_prompt = self.cache_seq_len == 0;

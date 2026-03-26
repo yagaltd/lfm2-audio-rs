@@ -44,8 +44,6 @@ pub struct InterleavedOptions {
     pub audio_top_k: usize,
     pub interleaved_n_text: Option<usize>,
     pub interleaved_n_audio: Option<usize>,
-    /// If true, stop at <|audio_start|> and return text only (for external TTS)
-    pub text_only: bool,
 }
 
 impl Default for InterleavedOptions {
@@ -58,7 +56,6 @@ impl Default for InterleavedOptions {
             audio_top_k: 4,
             interleaved_n_text: None,
             interleaved_n_audio: None,
-            text_only: false,
         }
     }
 }
@@ -240,23 +237,6 @@ impl<'a> InterleavedPipeline<'a> {
         let prefix_embeds = self.model.get_text_embeddings(&prefix_ids);
         let (logits, hidden_states) = self.prefill_decoder(&prefix_embeds, cache, cache_seq_len)?;
 
-        // Use sequential generation for text-only mode
-        if options.text_only {
-            let (text, audio_codes) = self.generate_sequential_response(
-                logits,
-                hidden_states,
-                cache,
-                cache_seq_len,
-                options,
-                on_event,
-            )?;
-            return Ok(InterleavedResponse {
-                text,
-                audio: Vec::new(),
-                audio_codes,
-            });
-        }
-
         self.generate_interleaved_response(
             logits,
             hidden_states,
@@ -372,23 +352,6 @@ impl<'a> InterleavedPipeline<'a> {
 
         let (logits, hidden_states) = self.prefill_decoder(&all_embeds, cache, cache_seq_len)?;
 
-        // Use sequential generation for text-only mode
-        if options.text_only {
-            let (text, audio_codes) = self.generate_sequential_response(
-                logits,
-                hidden_states,
-                cache,
-                cache_seq_len,
-                options,
-                on_event,
-            )?;
-            return Ok(InterleavedResponse {
-                text,
-                audio: Vec::new(),
-                audio_codes,
-            });
-        }
-
         self.generate_interleaved_response(
             logits,
             hidden_states,
@@ -414,88 +377,6 @@ impl<'a> InterleavedPipeline<'a> {
         Ok(result)
     }
 
-    /// Generate text sequentially (text-only mode) until <|audio_start|> or <|im_end|>
-    /// This is a cleaner implementation that doesn't use interleaved logic at all
-    fn generate_sequential_response(
-        &self,
-        mut logits: Array3<f32>,
-        mut hidden_states: Array3<f32>,
-        cache: &mut GenerationCache,
-        cache_seq_len: &mut usize,
-        options: &InterleavedOptions,
-        mut on_event: Option<&mut dyn FnMut(InterleavedEvent) -> Result<()>>,
-    ) -> Result<(String, Vec<[u16; 8]>)> {
-        let tts = TTSPipeline::new(self.model);
-        let special = self.model.tokenizer.special_tokens();
-        let mut text_tokens = Vec::new();
-        let mut total_len = *cache_seq_len;
-        
-        // Use lower temperature for more deterministic text generation
-        let text_temperature = options.text_temperature.min(0.5);
-        
-        log::info!("Sequential generation starting with temperature={}", text_temperature);
-
-        for step in 0..options.max_new_tokens {
-            let last_logits = extract_last_logits(&logits, self.model.config.lfm.vocab_size)?;
-            let token = if text_temperature == 0.0 {
-                argmax(&last_logits)
-            } else {
-                sample_with_temperature(&last_logits, text_temperature)
-            };
-
-            // Log first few tokens for debugging
-            if step < 5 {
-                log::debug!(
-                    "Step {}: token_id={}, token='{}'",
-                    step,
-                    token,
-                    self.model.tokenizer.decode(&[token], false)
-                );
-            }
-
-            // Stop conditions
-            if token == special.end_of_text || token == special.im_end {
-                log::info!("Sequential: reached end token {} after {} tokens", token, text_tokens.len());
-                break;
-            }
-
-            if token == special.audio_start {
-                log::info!("Sequential: reached audio_start after {} text tokens", text_tokens.len());
-                break;
-            }
-
-            text_tokens.push(token);
-            
-            // Stream text updates
-            if let Some(callback) = on_event.as_mut() {
-                callback(InterleavedEvent::TextUpdated(
-                    self.model.tokenizer.decode(&text_tokens, true),
-                ))?;
-            }
-
-            // Next step
-            let next_embeds = self.model.get_text_embeddings(&[token]);
-            total_len += 1;
-            let attention_mask = Array2::<i64>::ones((1, total_len));
-            let (new_logits, new_hidden_states) =
-                tts.run_decoder_with_hidden(&next_embeds, &attention_mask, cache)?;
-            logits = new_logits;
-            hidden_states = new_hidden_states;
-        }
-
-        // Append im_end to cache for proper context
-        let im_end_embeds = self.model.get_text_embeddings(&[special.im_end]);
-        total_len += 1;
-        let attention_mask = Array2::<i64>::ones((1, total_len));
-        let _ = tts.run_decoder_with_hidden(&im_end_embeds, &attention_mask, cache)?;
-        *cache_seq_len = total_len;
-
-        let text = self.model.tokenizer.decode(&text_tokens, true);
-        log::info!("Sequential generation complete: {} tokens, text_len={}", text_tokens.len(), text.len());
-        
-        Ok((text, Vec::new())) // No audio codes in sequential mode
-    }
-
     fn generate_interleaved_response(
         &self,
         mut logits: Array3<f32>,
@@ -512,31 +393,16 @@ impl<'a> InterleavedPipeline<'a> {
         let mut audio_codes = Vec::new();
         let mut total_len = *cache_seq_len;
         let mut in_audio_mode = false;
-        // In text_only mode (sequential), we generate ALL text until <|audio_start|> or <|im_end|>
-        // In interleaved mode, we alternate between text and audio based on n_text/n_audio
-        let interleaved_n_text = if options.text_only {
-            usize::MAX // No limit for sequential mode - generate all text
-        } else {
-            self.interleaved_n_text(options)
-        };
-        
-        // Use lower temperature for text_only mode to prevent hallucination
-        let text_temperature = if options.text_only {
-            options.text_temperature.min(0.7) // Cap at 0.7 for more deterministic output
-        } else {
-            options.text_temperature
-        };
+        let interleaved_n_text = self.interleaved_n_text(options);
         let interleaved_n_audio = self.interleaved_n_audio(options);
         let mut modality_left = interleaved_n_text;
         let mut text_done = false;
+        let text_temperature = options.text_temperature;
 
         for _step in 0..options.max_new_tokens {
             modality_left = modality_left.saturating_sub(1);
 
             let next_embeds = if in_audio_mode {
-                // In text_only mode, we should never enter audio mode
-                debug_assert!(!options.text_only, "text_only mode should not enter audio generation");
-                
                 let last_hidden = tts.extract_last_hidden(&hidden_states);
                 let mut frame = tts.sample_audio_frame(
                     &last_hidden,
@@ -601,18 +467,9 @@ impl<'a> InterleavedPipeline<'a> {
                 }
 
                 if token == special.audio_start {
-                    // Text-only mode: stop here and return text for external TTS
-                    if options.text_only {
-                        log::info!(
-                            "Interleaved: text_only mode - stopping at audio_start after {} text tokens",
-                            text_tokens.len()
-                        );
-                        break;
-                    }
                     in_audio_mode = true;
                     modality_left = interleaved_n_audio;
-                } else if (modality_left == 0 || text_done) && !options.text_only {
-                    // In interleaved mode (not text_only), switch to audio when text limit reached
+                } else if modality_left == 0 || text_done {
                     in_audio_mode = true;
                     modality_left = interleaved_n_audio;
                 }

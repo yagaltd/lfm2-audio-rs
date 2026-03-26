@@ -23,10 +23,6 @@ const vadThresholdValue = document.getElementById("vadThresholdValue");
 const silenceTimeoutInput = document.getElementById("silenceTimeout");
 const minSpeechMsInput = document.getElementById("minSpeechMs");
 const showTranscriptInput = document.getElementById("showTranscript");
-const fastTtsModeInput = document.getElementById("fastTtsMode");
-if (!fastTtsModeInput) {
-  console.error("fastTtsMode checkbox not found!");
-}
 const connectionState = document.getElementById("connectionState");
 const phaseState = document.getElementById("phaseState");
 const vadMeter = document.getElementById("vadMeter");
@@ -330,15 +326,11 @@ function connectSocket() {
     setConnectionLabel("Connected");
     setPhase("Listening");
     updateControls();
-    const ttsBackend = fastTtsModeInput.checked ? "kitten" : "lfm2";
-    const msg = {
+    log("WebSocket connected");
+    ws.send(JSON.stringify({
       type: "session.start",
       system_prompt: systemPromptInput.value.trim(),
-      tts_backend: ttsBackend,
-    };
-    log(`WebSocket connected (TTS: ${ttsBackend}, checked=${fastTtsModeInput.checked})`);
-    console.log("Sending session.start:", msg);
-    ws.send(JSON.stringify(msg));
+    }));
   });
 
   ws.addEventListener("close", () => {
@@ -670,84 +662,6 @@ vadThresholdInput.addEventListener("input", () => {
   if (vadModule) {
     recreateVAD();
   }
-});
-
-// === Standalone TTS ===
-const synthesizeBtn = document.getElementById("synthesizeBtn");
-const ttsInput = document.getElementById("ttsInput");
-const ttsBackend = document.getElementById("ttsBackend");
-const ttsVoice = document.getElementById("ttsVoice");
-const ttsStatus = document.getElementById("ttsStatus");
-const ttsAudio = document.getElementById("ttsAudio");
-
-async function synthesizeTTS() {
-  const text = ttsInput.value.trim();
-  if (!text) {
-    ttsStatus.textContent = "Enter text first";
-    return;
-  }
-
-  const backend = ttsBackend.value;
-  const voice = ttsVoice.value;
-
-  synthesizeBtn.disabled = true;
-  ttsStatus.textContent = `Synthesizing with ${backend}...`;
-
-  const startTime = performance.now();
-
-  try {
-    const response = await fetch("/v1/audio/speech", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: text,
-        backend: backend,
-        voice: voice,
-      }),
-    });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(error);
-    }
-
-    const blob = await response.blob();
-    const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
-    const audioUrl = URL.createObjectURL(blob);
-
-    ttsAudio.src = audioUrl;
-    ttsAudio.play();
-
-    ttsStatus.textContent = `Done in ${elapsed}s (${backend})`;
-  } catch (error) {
-    ttsStatus.textContent = `Error: ${error.message}`;
-    console.error("TTS error:", error);
-  } finally {
-    synthesizeBtn.disabled = false;
-  }
-}
-
-synthesizeBtn.addEventListener("click", synthesizeTTS);
-ttsInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
-    synthesizeTTS();
-  }
-});
-
-// Update voice selector state based on backend
-ttsBackend.addEventListener("change", () => {
-  const isKitten = ttsBackend.value === "kitten";
-  ttsVoice.disabled = !isKitten;
-  if (!isKitten) {
-    ttsVoice.value = "Bella";
-  }
-});
-ttsVoice.disabled = ttsBackend.value !== "kitten";
-
-// Fast TTS mode toggle - requires reconnect to take effect
-fastTtsModeInput.addEventListener("change", () => {
-  const mode = fastTtsModeInput.checked ? "KittenTTS (~50ms/frame)" : "LFM2 (~90ms/frame)";
-  log(`TTS mode changed to ${mode}. ${ws && ws.readyState === WebSocket.OPEN ? "Reconnect to apply." : "Will apply on next connection."}`);
 });
 
 updateVadThresholdLabel();

@@ -47,18 +47,14 @@ base64 = { version = "0.22", optional = true }
 futures-util = { version = "0.3", optional = true }
 tower-http = { version = "0.6", features = ["cors", "fs"], optional = true }
 
-# KittenTTS - lightweight TTS alternative (25MB vs 54MB LFM2 detokenizer)
-kitten-tts = { path = "../kitten_tts_rs", optional = true }
-
 [features]
 default = ["cli"]
 cli = ["dep:clap"]
 server = ["dep:axum", "dep:tokio", "dep:tokio-stream", "dep:tracing", "dep:tracing-subscriber", "dep:base64", "dep:futures-util", "dep:tower-http"]
-kitten-tts = ["dep:kitten-tts"]
-cuda = ["ort/cuda", "kitten-tts?/cuda"]
-tensorrt = ["ort/tensorrt", "kitten-tts?/tensorrt"]
-coreml = ["ort/coreml", "kitten-tts?/coreml"]
-directml = ["ort/directml", "kitten-tts?/directml"]
+cuda = ["ort/cuda"]
+tensorrt = ["ort/tensorrt"]
+coreml = ["ort/coreml"]
+directml = ["ort/directml"]
 
 [[bin]]
 name = "lfm2-audio"

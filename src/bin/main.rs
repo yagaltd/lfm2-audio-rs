@@ -366,7 +366,7 @@ fn cmd_interleaved(
         audio_top_k,
         interleaved_n_text: None,
         interleaved_n_audio: None,
-        text_only: false,
+
     };
 
     let response = match (prompt, audio) {
