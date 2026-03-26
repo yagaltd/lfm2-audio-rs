@@ -240,6 +240,23 @@ impl<'a> InterleavedPipeline<'a> {
         let prefix_embeds = self.model.get_text_embeddings(&prefix_ids);
         let (logits, hidden_states) = self.prefill_decoder(&prefix_embeds, cache, cache_seq_len)?;
 
+        // Use sequential generation for text-only mode
+        if options.text_only {
+            let (text, audio_codes) = self.generate_sequential_response(
+                logits,
+                hidden_states,
+                cache,
+                cache_seq_len,
+                options,
+                on_event,
+            )?;
+            return Ok(InterleavedResponse {
+                text,
+                audio: Vec::new(),
+                audio_codes,
+            });
+        }
+
         self.generate_interleaved_response(
             logits,
             hidden_states,
@@ -355,6 +372,23 @@ impl<'a> InterleavedPipeline<'a> {
 
         let (logits, hidden_states) = self.prefill_decoder(&all_embeds, cache, cache_seq_len)?;
 
+        // Use sequential generation for text-only mode
+        if options.text_only {
+            let (text, audio_codes) = self.generate_sequential_response(
+                logits,
+                hidden_states,
+                cache,
+                cache_seq_len,
+                options,
+                on_event,
+            )?;
+            return Ok(InterleavedResponse {
+                text,
+                audio: Vec::new(),
+                audio_codes,
+            });
+        }
+
         self.generate_interleaved_response(
             logits,
             hidden_states,
@@ -378,6 +412,88 @@ impl<'a> InterleavedPipeline<'a> {
         let result = tts.run_decoder_with_hidden(input_embeds, &attention_mask, cache)?;
         *cache_seq_len = total_len;
         Ok(result)
+    }
+
+    /// Generate text sequentially (text-only mode) until <|audio_start|> or <|im_end|>
+    /// This is a cleaner implementation that doesn't use interleaved logic at all
+    fn generate_sequential_response(
+        &self,
+        mut logits: Array3<f32>,
+        mut hidden_states: Array3<f32>,
+        cache: &mut GenerationCache,
+        cache_seq_len: &mut usize,
+        options: &InterleavedOptions,
+        mut on_event: Option<&mut dyn FnMut(InterleavedEvent) -> Result<()>>,
+    ) -> Result<(String, Vec<[u16; 8]>)> {
+        let tts = TTSPipeline::new(self.model);
+        let special = self.model.tokenizer.special_tokens();
+        let mut text_tokens = Vec::new();
+        let mut total_len = *cache_seq_len;
+        
+        // Use lower temperature for more deterministic text generation
+        let text_temperature = options.text_temperature.min(0.5);
+        
+        log::info!("Sequential generation starting with temperature={}", text_temperature);
+
+        for step in 0..options.max_new_tokens {
+            let last_logits = extract_last_logits(&logits, self.model.config.lfm.vocab_size)?;
+            let token = if text_temperature == 0.0 {
+                argmax(&last_logits)
+            } else {
+                sample_with_temperature(&last_logits, text_temperature)
+            };
+
+            // Log first few tokens for debugging
+            if step < 5 {
+                log::debug!(
+                    "Step {}: token_id={}, token='{}'",
+                    step,
+                    token,
+                    self.model.tokenizer.decode(&[token], false)
+                );
+            }
+
+            // Stop conditions
+            if token == special.end_of_text || token == special.im_end {
+                log::info!("Sequential: reached end token {} after {} tokens", token, text_tokens.len());
+                break;
+            }
+
+            if token == special.audio_start {
+                log::info!("Sequential: reached audio_start after {} text tokens", text_tokens.len());
+                break;
+            }
+
+            text_tokens.push(token);
+            
+            // Stream text updates
+            if let Some(callback) = on_event.as_mut() {
+                callback(InterleavedEvent::TextUpdated(
+                    self.model.tokenizer.decode(&text_tokens, true),
+                ))?;
+            }
+
+            // Next step
+            let next_embeds = self.model.get_text_embeddings(&[token]);
+            total_len += 1;
+            let attention_mask = Array2::<i64>::ones((1, total_len));
+            let (new_logits, new_hidden_states) =
+                tts.run_decoder_with_hidden(&next_embeds, &attention_mask, cache)?;
+            logits = new_logits;
+            hidden_states = new_hidden_states;
+        }
+
+        // Append im_end to cache for proper context
+        let im_end_embeds = self.model.get_text_embeddings(&[special.im_end]);
+        total_len += 1;
+        let attention_mask = Array2::<i64>::ones((1, total_len));
+        let _ = tts.run_decoder_with_hidden(&im_end_embeds, &attention_mask, cache)?;
+        *cache_seq_len = total_len;
+
+        let text = self.model.tokenizer.decode(&text_tokens, true);
+        log::info!("Sequential generation complete: {} tokens, text_len={}", text_tokens.len(), text.len());
+        
+        Ok((text, Vec::new())) // No audio codes in sequential mode
     }
 
     fn generate_interleaved_response(
