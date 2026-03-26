@@ -64,11 +64,12 @@ The script:
 - Baseline on the honest websocket benchmark: `realtime_penalty_ms=15376`, `first_playable_audio_ms=1478`, `overlap_ms=13440`, holdout overlap `58240`. Replay completely dominated the user-visible penalty.
 - **Keep:** update `last_emitted_samples` immediately after each decode and slice new waveform tails from that tracked position. Result: `realtime_penalty_ms=2842`, `overlap_ms=0`, holdout overlap `0`. This fixed the correctness bug and removed the huge replay penalty.
 - **Keep:** reduce the default streaming decode batch from 4 frames to 2 frames. Result: `realtime_penalty_ms=2201`, `first_playable_audio_ms=910`, `max_chunk_deficit_ms=1332`, holdout penalty `2140`. This improved startup and chunk deficit without bringing overlap back, but total turn time jumped to ~43s and chunk count to 38.
+- **Keep:** reduce default streaming decode context from 16 frames to 0 frames. Result: `realtime_penalty_ms=1047`, `first_playable_audio_ms=769`, `max_chunk_deficit_ms=285`, `total_turn_ms=13324`, holdout penalty `1057`. This recovered throughput while keeping overlap at zero, making it the best result so far.
 - **Crash/Discard insight:** a 1-frame batch improved startup further (~0.6s first playable) but exploded chunk count enough that the tune suite stopped completing reliably under the harness.
-- After the tail fix, the dominant bottleneck is now starvation/throughput rather than overlap. Batch=2 is currently the best tradeoff seen, but it is still far from smooth realtime.
+- After the tail fix, context retention turned out to be the biggest remaining CPU cost. With context=0 and batch=2, the system is much closer to tolerable realtime but still not smooth enough.
 - Current pacing still uses chunk-count startup gating, which is suspicious because chunk duration varies dramatically when decode windows grow.
 
 ## Current Hypotheses
-1. The biggest remaining gain is now in pacing and decode granularity, not correctness: we need more buffered-audio-aware scheduling and/or smaller/faster chunk production.
+1. The biggest remaining gain is now likely in pacing, not overlap or decode-window bookkeeping.
 2. Millisecond-based pacing should reduce startup latency and may smooth delivery better than chunk-count startup gating.
-3. Reducing or reshaping context retention may improve throughput further now that true tail emission is working.
+3. If pacing yields only marginal gains, the next structural option is decoupling generation from detokenization so decode work is hidden behind frame generation again.

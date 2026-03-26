@@ -44,7 +44,7 @@ const DEFAULT_SYSTEM_PROMPT_INTERLEAVED: &str = "Respond with interleaved text a
 const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_DECODE_BATCH_FRAMES: usize = 2;
-const STREAM_DECODE_CONTEXT_FRAMES: usize = 16;
+const STREAM_DECODE_CONTEXT_FRAMES: usize = 0;
 const STREAM_OUTPUT_QUEUE_CHUNKS: usize = 2;
 
 #[derive(Clone)]
@@ -1883,8 +1883,8 @@ mod tests {
     use super::{
         background_worker_index, chunk_playback_duration, effective_worker_count,
         parse_device_preference, split_new_waveform_tail, STREAM_DECODE_BATCH_FRAMES,
-        STREAM_OUTPUT_QUEUE_CHUNKS, AudioOutputPacer, Device, DevicePreference,
-        OutputQueueConfig, StreamingAudioDecoder,
+        STREAM_DECODE_CONTEXT_FRAMES, STREAM_OUTPUT_QUEUE_CHUNKS, AudioOutputPacer,
+        Device, DevicePreference, OutputQueueConfig, StreamingAudioDecoder,
     };
     use lfm2_audio::{LFM2Audio, Precision, TTSOptions};
     use std::path::PathBuf;
@@ -1974,6 +1974,11 @@ mod tests {
     #[test]
     fn default_stream_decode_batch_is_two_frames() {
         assert_eq!(STREAM_DECODE_BATCH_FRAMES, 2);
+    }
+
+    #[test]
+    fn default_stream_decode_context_is_zero_frames() {
+        assert_eq!(STREAM_DECODE_CONTEXT_FRAMES, 0);
     }
 
     #[test]
