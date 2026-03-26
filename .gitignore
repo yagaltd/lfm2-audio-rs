@@ -1,4 +1,7 @@
 /target
+autoresearch*
+docs/superpowers/
+examples/
 node_modules/
 server.log
 server.log.clean
