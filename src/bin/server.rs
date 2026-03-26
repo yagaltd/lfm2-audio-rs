@@ -1731,7 +1731,12 @@ async fn handle_client_message(
             if session_settings.tts_backend == "kitten" {
                 if let Some(ref kitten_tts) = state.kitten_tts {
                     if !response.text.trim().is_empty() {
-                        info!(session_id, text_len = response.text.len(), "Synthesizing with KittenTTS");
+                        info!(
+                            session_id,
+                            text_len = response.text.len(),
+                            text_preview = %response.text.chars().take(100).collect::<String>(),
+                            "Synthesizing with KittenTTS (text turn)"
+                        );
                         
                         let mut model = kitten_tts.lock().await;
                         let synthesis_start = Instant::now();
@@ -1898,7 +1903,12 @@ async fn handle_client_message(
             if session_settings.tts_backend == "kitten" {
                 if let Some(ref kitten_tts) = state.kitten_tts {
                     if !response.text.trim().is_empty() {
-                        info!(session_id, text_len = response.text.len(), "Synthesizing with KittenTTS");
+                        info!(
+                            session_id,
+                            text_len = response.text.len(),
+                            text_preview = %response.text.chars().take(100).collect::<String>(),
+                            "Synthesizing with KittenTTS (audio turn)"
+                        );
                         
                         let mut model = kitten_tts.lock().await;
                         let synthesis_start = Instant::now();

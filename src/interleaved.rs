@@ -396,7 +396,13 @@ impl<'a> InterleavedPipeline<'a> {
         let mut audio_codes = Vec::new();
         let mut total_len = *cache_seq_len;
         let mut in_audio_mode = false;
-        let interleaved_n_text = self.interleaved_n_text(options);
+        // In text_only mode (sequential), we generate ALL text until <|audio_start|> or <|im_end|>
+        // In interleaved mode, we alternate between text and audio based on n_text/n_audio
+        let interleaved_n_text = if options.text_only {
+            usize::MAX // No limit for sequential mode - generate all text
+        } else {
+            self.interleaved_n_text(options)
+        };
         let interleaved_n_audio = self.interleaved_n_audio(options);
         let mut modality_left = interleaved_n_text;
         let mut text_done = false;
@@ -405,6 +411,9 @@ impl<'a> InterleavedPipeline<'a> {
             modality_left = modality_left.saturating_sub(1);
 
             let next_embeds = if in_audio_mode {
+                // In text_only mode, we should never enter audio mode
+                debug_assert!(!options.text_only, "text_only mode should not enter audio generation");
+                
                 let last_hidden = tts.extract_last_hidden(&hidden_states);
                 let mut frame = tts.sample_audio_frame(
                     &last_hidden,
@@ -446,6 +455,11 @@ impl<'a> InterleavedPipeline<'a> {
                 };
 
                 if token == special.end_of_text || token == special.im_end {
+                    log::info!(
+                        "Interleaved: reached end token {} after {} text tokens",
+                        token,
+                        text_tokens.len()
+                    );
                     break;
                 }
 
@@ -456,17 +470,16 @@ impl<'a> InterleavedPipeline<'a> {
                 if token == special.audio_start {
                     // Text-only mode: stop here and return text for external TTS
                     if options.text_only {
-                        log::info!("Interleaved: text_only mode - stopping at audio_start token");
+                        log::info!(
+                            "Interleaved: text_only mode - stopping at audio_start after {} text tokens",
+                            text_tokens.len()
+                        );
                         break;
                     }
                     in_audio_mode = true;
                     modality_left = interleaved_n_audio;
-                } else if modality_left == 0 || text_done {
-                    // Text-only mode: stop here too
-                    if options.text_only {
-                        log::info!("Interleaved: text_only mode - stopping before audio (modality_left=0 or text_done)");
-                        break;
-                    }
+                } else if (modality_left == 0 || text_done) && !options.text_only {
+                    // In interleaved mode (not text_only), switch to audio when text limit reached
                     in_audio_mode = true;
                     modality_left = interleaved_n_audio;
                 }
