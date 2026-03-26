@@ -456,6 +456,7 @@ impl<'a> InterleavedPipeline<'a> {
                 if token == special.audio_start {
                     // Text-only mode: stop here and return text for external TTS
                     if options.text_only {
+                        log::info!("Interleaved: text_only mode - stopping at audio_start token");
                         break;
                     }
                     in_audio_mode = true;
@@ -463,6 +464,7 @@ impl<'a> InterleavedPipeline<'a> {
                 } else if modality_left == 0 || text_done {
                     // Text-only mode: stop here too
                     if options.text_only {
+                        log::info!("Interleaved: text_only mode - stopping before audio (modality_left=0 or text_done)");
                         break;
                     }
                     in_audio_mode = true;

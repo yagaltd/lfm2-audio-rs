@@ -1145,6 +1145,7 @@ fn model_worker(
                     ))
                 });
                 session.set_text_only(text_only);
+                info!(session_id, text_only, "SessionText: text_only mode set");
                 session.add_user_text(&text);
                 // Use async decoder for background ONNX inference
                 let mut audio_decoder = AsyncStreamingDecoder::new(
@@ -1307,6 +1308,7 @@ fn model_worker(
                 });
                 // Set text-only mode for external TTS (KittenTTS)
                 session.set_text_only(text_only);
+                info!(session_id, text_only, "SessionAudio: text_only mode set");
                 let add_result =
                     session.add_user_audio_with_text(&audio, sample_rate, text_prompt.as_deref());
                 // Use async decoder for background ONNX inference
