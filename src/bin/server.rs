@@ -45,7 +45,7 @@ const MAX_BINARY_AUDIO_BYTES: usize = 8 * 1024 * 1024;
 const STREAM_EVENT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_DECODE_BATCH_FRAMES: usize = 2;
 const STREAM_DECODE_CONTEXT_FRAMES: usize = 0;
-const STREAM_OUTPUT_QUEUE_CHUNKS: usize = 2;
+const STREAM_OUTPUT_QUEUE_CHUNKS: usize = 1;
 
 #[derive(Clone)]
 struct AppState {
@@ -1967,8 +1967,8 @@ mod tests {
     }
 
     #[test]
-    fn default_stream_output_queue_starts_after_two_chunks() {
-        assert_eq!(STREAM_OUTPUT_QUEUE_CHUNKS, 2);
+    fn default_stream_output_queue_starts_after_one_chunk() {
+        assert_eq!(STREAM_OUTPUT_QUEUE_CHUNKS, 1);
     }
 
     #[test]
