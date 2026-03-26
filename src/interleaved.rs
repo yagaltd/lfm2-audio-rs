@@ -403,6 +403,13 @@ impl<'a> InterleavedPipeline<'a> {
         } else {
             self.interleaved_n_text(options)
         };
+        
+        // Use lower temperature for text_only mode to prevent hallucination
+        let text_temperature = if options.text_only {
+            options.text_temperature.min(0.7) // Cap at 0.7 for more deterministic output
+        } else {
+            options.text_temperature
+        };
         let interleaved_n_audio = self.interleaved_n_audio(options);
         let mut modality_left = interleaved_n_text;
         let mut text_done = false;
@@ -448,11 +455,21 @@ impl<'a> InterleavedPipeline<'a> {
                 self.model.get_audio_embeddings(&feed_codes)?
             } else {
                 let last_logits = extract_last_logits(&logits, self.model.config.lfm.vocab_size)?;
-                let token = if options.text_temperature == 0.0 {
+                let token = if text_temperature == 0.0 {
                     argmax(&last_logits)
                 } else {
-                    sample_with_temperature(&last_logits, options.text_temperature)
+                    sample_with_temperature(&last_logits, text_temperature)
                 };
+
+                // Debug: log first few tokens and any unusual tokens
+                if text_tokens.len() < 10 || token > 1000 {
+                    log::debug!(
+                        "Text token {}: id={}, token_str='{}'",
+                        text_tokens.len(),
+                        token,
+                        self.model.tokenizer.decode(&[token], false)
+                    );
+                }
 
                 if token == special.end_of_text || token == special.im_end {
                     log::info!(
