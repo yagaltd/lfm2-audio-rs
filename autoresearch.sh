@@ -37,4 +37,6 @@ while time.time() < deadline:
 raise SystemExit(1)
 PY
 
-BENCH_WS_URL="ws://127.0.0.1:${PORT}/ws/interleaved" node scripts/bench_realtime_ws.mjs
+BENCH_TIMEOUT_MS="${BENCH_TIMEOUT_MS:-180000}" \
+BENCH_WS_URL="ws://127.0.0.1:${PORT}/ws/interleaved" \
+node scripts/bench_realtime_ws.mjs

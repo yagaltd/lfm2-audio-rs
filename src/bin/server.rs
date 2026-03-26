@@ -475,6 +475,24 @@ struct OnnxStreamingAudioDecoder<'a> {
     last_emitted_samples: usize,
 }
 
+fn split_new_waveform_tail(
+    waveform: Vec<f32>,
+    last_emitted_samples: usize,
+) -> ApiResult<(Vec<f32>, usize)> {
+    if last_emitted_samples > waveform.len() {
+        return Err(ApiError::internal(
+            "streaming detokenizer produced no new waveform tail",
+        ));
+    }
+
+    let next_emitted_samples = waveform.len();
+    if last_emitted_samples == 0 {
+        return Ok((waveform, next_emitted_samples));
+    }
+
+    Ok((waveform[last_emitted_samples..].to_vec(), next_emitted_samples))
+}
+
 impl<'a> OnnxStreamingAudioDecoder<'a> {
     fn new(model: &'a LFM2Audio, config: StreamingDecodeConfig, session_id: u64) -> Self {
         Self {
@@ -522,20 +540,12 @@ impl<'a> OnnxStreamingAudioDecoder<'a> {
 
         let full_decode_ms = decode_started_at.elapsed().as_millis() as u64;
 
-        // Slice off new portion using cached sample position
-        // No re-decode needed - we track where we left off
-        let (new_waveform, context_decode_ms) = if self.last_emitted_samples == 0 {
-            (waveform, 0)
-        } else {
-            if self.last_emitted_samples >= waveform.len() {
-                return Err(ApiError::internal(
-                    "streaming detokenizer produced no new waveform tail",
-                ));
-            }
-            (waveform[self.last_emitted_samples..].to_vec(), 0)
-        };
+        let (new_waveform, next_emitted_samples) =
+            split_new_waveform_tail(waveform, self.last_emitted_samples)?;
+        self.last_emitted_samples = next_emitted_samples;
 
         self.retain_recent_context();
+        let context_decode_ms = 0;
         let decode_index = self.decode_index + 1;
         self.decode_index = decode_index;
 
@@ -1872,7 +1882,7 @@ fn resolve_tts_system_prompt(system_prompt: Option<&str>, voice: Option<&str>) -
 mod tests {
     use super::{
         background_worker_index, chunk_playback_duration, effective_worker_count,
-        parse_device_preference, STREAM_OUTPUT_QUEUE_CHUNKS,
+        parse_device_preference, split_new_waveform_tail, STREAM_OUTPUT_QUEUE_CHUNKS,
         AudioOutputPacer, Device, DevicePreference, OutputQueueConfig, StreamingAudioDecoder,
     };
     use lfm2_audio::{LFM2Audio, Precision, TTSOptions};
@@ -1958,6 +1968,26 @@ mod tests {
     #[test]
     fn default_stream_output_queue_starts_after_two_chunks() {
         assert_eq!(STREAM_OUTPUT_QUEUE_CHUNKS, 2);
+    }
+
+    #[test]
+    fn waveform_tail_tracking_advances_after_first_emit() {
+        let waveform = vec![0.0; 7_680];
+        let (new_waveform, next_emitted_samples) =
+            split_new_waveform_tail(waveform, 0).expect("first emit should succeed");
+
+        assert_eq!(new_waveform.len(), 7_680);
+        assert_eq!(next_emitted_samples, 7_680);
+    }
+
+    #[test]
+    fn waveform_tail_tracking_only_returns_new_samples_after_previous_emit() {
+        let waveform = vec![0.0; 15_360];
+        let (new_waveform, next_emitted_samples) = split_new_waveform_tail(waveform, 7_680)
+            .expect("subsequent emit should slice only the new tail");
+
+        assert_eq!(new_waveform.len(), 7_680);
+        assert_eq!(next_emitted_samples, 15_360);
     }
 
     fn get_model_path() -> Option<PathBuf> {

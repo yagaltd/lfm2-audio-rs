@@ -60,11 +60,13 @@ The script:
 - `In two short sentences, explain why the sky looks blue and speak it.`
 
 ## What’s Been Tried
-- Previous branch work optimized frame-gap timing directly, but the current code inspection and websocket reproduction show a more basic likely issue: streamed chunks appear to replay overlapping waveform windows because server-side tail accounting is wrong.
-- Reproduction on the live websocket path showed first playable audio around 1.4–1.5s after request send, while streamed audio duration greatly exceeded unique audio duration implied by frame count. This suggests a correctness bug plus a thin realtime margin.
-- Current pacing also uses chunk-count startup gating, which is suspicious because chunk duration varies dramatically when decode windows grow.
+- Previous branch work optimized frame-gap timing directly, but the current code inspection and websocket reproduction showed a more basic likely issue: streamed chunks were replaying overlapping waveform windows because server-side tail accounting was wrong.
+- Baseline on the honest websocket benchmark: `realtime_penalty_ms=15376`, `first_playable_audio_ms=1478`, `overlap_ms=13440`, holdout overlap `58240`. Replay completely dominated the user-visible penalty.
+- **Keep:** update `last_emitted_samples` immediately after each decode and slice new waveform tails from that tracked position. Result: `realtime_penalty_ms=2842`, `overlap_ms=0`, holdout overlap `0`. This fixed the correctness bug and removed the huge replay penalty.
+- After the tail fix, the dominant bottleneck is now starvation/throughput rather than overlap: `max_chunk_deficit_ms` increased to ~1.3–1.5s and first playable audio stayed around 1.54s.
+- Current pacing still uses chunk-count startup gating, which is suspicious because chunk duration varies dramatically when decode windows grow.
 
 ## Current Hypotheses
-1. Fixing streamed tail accounting in `OnnxStreamingAudioDecoder` will sharply reduce overlap/replay and improve user-perceived smoothness more than any buffer tweak.
-2. After correctness is fixed, millisecond-based pacing should reduce startup latency without reintroducing starvation.
-3. Only after those two fixes should we tune decode batch/context sizes or attempt structural producer/consumer decoupling.
+1. The biggest remaining gain is now in pacing and decode granularity, not correctness: we need more buffered-audio-aware scheduling and/or smaller/faster chunk production.
+2. Millisecond-based pacing should reduce startup latency and may smooth delivery better than chunk-count startup gating.
+3. If pacing alone is not enough, tuning `stream_batch_frames` / `stream_context_frames` should attack starvation directly before any larger architectural changes.
